@@ -389,6 +389,24 @@ func TestParsePbtxtTitleAndCleanPromptSummary(t *testing.T) {
 	}
 }
 
+func TestGetLLMSessionTitle_FromPbtxt(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("ANTIGRAVITY_APP_DATA_DIR", tempDir)
+	if err := os.MkdirAll(filepath.Join(tempDir, "annotations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "annotations", "sid-1.pbtxt"), []byte(`title:"Greetings Conversation"`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{workDir: "/tmp"}
+	if got := a.GetLLMSessionTitle("sid-1"); got != "Greetings Conversation" {
+		t.Fatalf("GetLLMSessionTitle = %q", got)
+	}
+	if got := a.GetLLMSessionTitle("missing"); got != "" {
+		t.Fatalf("missing = %q, want empty", got)
+	}
+}
+
 func TestScanPreEntriesAndDetectNewSessionID(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Setenv("ANTIGRAVITY_APP_DATA_DIR", tempDir)
@@ -500,4 +518,3 @@ func TestScanPreEntriesAndDetectNewSessionID(t *testing.T) {
 		t.Fatal("expected error deleting invalid session ID")
 	}
 }
-

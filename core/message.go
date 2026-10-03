@@ -456,6 +456,7 @@ const (
 	EventError             EventType = "error"              // error occurred
 	EventPermissionRequest EventType = "permission_request" // agent requests permission via stdio protocol
 	EventThinking          EventType = "thinking"           // thinking/processing status
+	EventSessionTitle      EventType = "session_title"      // LLM-generated session title (not user-visible chat text)
 )
 
 // UserQuestion represents a structured question from AskUserQuestion.

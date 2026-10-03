@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,6 +49,178 @@ func TestHandleResultParsesUsage(t *testing.T) {
 	}
 	if !evt.Done {
 		t.Errorf("regular result event Done = false, want true")
+	}
+}
+
+func TestHandleAITitleEmitsSessionTitleEvent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cs := &claudeSession{events: make(chan core.Event, 4), ctx: ctx}
+	cs.handleAITitle(map[string]any{
+		"type":      "ai-title",
+		"aiTitle":   "Fix login button",
+		"sessionId": "sess-ai",
+	})
+	select {
+	case evt := <-cs.events:
+		if evt.Type != core.EventSessionTitle {
+			t.Fatalf("type = %q, want session_title", evt.Type)
+		}
+		if evt.Content != "Fix login button" {
+			t.Fatalf("content = %q", evt.Content)
+		}
+		if evt.SessionID != "sess-ai" {
+			t.Fatalf("session id = %q", evt.SessionID)
+		}
+	default:
+		t.Fatal("expected EventSessionTitle")
+	}
+}
+
+func TestHandleAITitleIgnoresEmpty(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cs := &claudeSession{events: make(chan core.Event, 1), ctx: ctx}
+	cs.handleAITitle(map[string]any{"type": "ai-title", "aiTitle": "  "})
+	select {
+	case evt := <-cs.events:
+		t.Fatalf("unexpected event %+v", evt)
+	default:
+	}
+}
+
+type stubTitleClient struct {
+	title string
+	err   error
+	calls atomic.Int32
+	last  atomic.Value
+}
+
+func (c *stubTitleClient) GenerateTitle(_ context.Context, prompt string) (string, error) {
+	c.calls.Add(1)
+	c.last.Store(prompt)
+	return c.title, c.err
+}
+
+func waitSessionTitleEvent(t *testing.T, events <-chan core.Event, timeout time.Duration) core.Event {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case evt := <-events:
+			if evt.Type == core.EventSessionTitle {
+				return evt
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for EventSessionTitle")
+		}
+	}
+	return core.Event{}
+}
+
+func TestSend_GeneratesLLMTitleOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mock := &stubTitleClient{title: "Fix login button"}
+	cs := &claudeSession{
+		stdin:       &recordingStdin{},
+		events:      make(chan core.Event, 8),
+		ctx:         ctx,
+		titleClient: mock,
+	}
+	cs.alive.Store(true)
+
+	if err := cs.Send("please look at the login button", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	evt := waitSessionTitleEvent(t, cs.events, 2*time.Second)
+	if evt.Content != "Fix login button" {
+		t.Fatalf("title = %q, want LLM title (not the user prompt)", evt.Content)
+	}
+	if mock.calls.Load() != 1 {
+		t.Fatalf("title client calls = %d, want 1", mock.calls.Load())
+	}
+
+	if err := cs.Send("follow-up about the same bug", "", nil, nil); err != nil {
+		t.Fatalf("second Send: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if mock.calls.Load() != 1 {
+		t.Fatalf("second Send generated another title, calls = %d", mock.calls.Load())
+	}
+	select {
+	case evt := <-cs.events:
+		t.Fatalf("unexpected extra event %+v", evt)
+	default:
+	}
+}
+
+func TestSend_SkipsSlashCommandTitle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mock := &stubTitleClient{title: "Should not appear"}
+	cs := &claudeSession{
+		stdin:       &recordingStdin{},
+		events:      make(chan core.Event, 2),
+		ctx:         ctx,
+		titleClient: mock,
+	}
+	cs.alive.Store(true)
+	if err := cs.Send("/compact", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if mock.calls.Load() != 0 {
+		t.Fatalf("slash command titled the session, calls = %d", mock.calls.Load())
+	}
+}
+
+func TestSend_DoesNotUseUserPromptAsTitle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prompt := "这个频道现在绑定项目目录了吗？"
+	mock := &stubTitleClient{title: prompt}
+	cs := &claudeSession{
+		stdin:       &recordingStdin{},
+		events:      make(chan core.Event, 2),
+		ctx:         ctx,
+		titleClient: mock,
+	}
+	cs.alive.Store(true)
+	if err := cs.Send(prompt, "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	select {
+	case evt := <-cs.events:
+		t.Fatalf("user prompt echoed as LLM title: %+v", evt)
+	default:
+	}
+}
+
+func TestTitleSourceText_StripsSenderHeader(t *testing.T) {
+	got := titleSourceText("[cc-connect sender_id=abc platform=discord chat_id=1]\n这个频道现在绑定项目目录了吗？")
+	if got != "这个频道现在绑定项目目录了吗？" {
+		t.Fatalf("titleSourceText = %q", got)
+	}
+	if titleSourceText("/compact") != "" {
+		t.Fatalf("slash command should not be titled")
+	}
+	if titleSourceText("  hi  ") != "hi" {
+		t.Fatalf("plain prompt = %q", titleSourceText("  hi  "))
+	}
+}
+
+func TestAcceptGeneratedSessionTitle_RejectsPlaceholder(t *testing.T) {
+	prompt := "please look at the login button"
+	if got := acceptGeneratedSessionTitle(prompt, prompt); got != "" {
+		t.Fatalf("echoed user prompt accepted as title: %q", got)
+	}
+	if got := acceptGeneratedSessionTitle(prompt, "  "); got != "" {
+		t.Fatalf("blank title accepted: %q", got)
+	}
+	if got := acceptGeneratedSessionTitle(prompt, "Fix login button"); got != "Fix login button" {
+		t.Fatalf("got %q", got)
 	}
 }
 
@@ -1059,7 +1232,7 @@ func itoa(i int) string {
 type recordingStdin struct{ buf bytes.Buffer }
 
 func (r *recordingStdin) Write(p []byte) (int, error) { return r.buf.Write(p) }
-func (r *recordingStdin) Close() error               { return nil }
+func (r *recordingStdin) Close() error                { return nil }
 
 func newControlSession(t *testing.T, mode string, stdin io.WriteCloser) *claudeSession {
 	ctx, cancel := context.WithCancel(context.Background())

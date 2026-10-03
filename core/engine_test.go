@@ -432,6 +432,28 @@ func (p *stubDoneReactionPlatform) doneSnapshot() (int, []any) {
 	return p.doneCount, ctxs
 }
 
+type stubFailReactionPlatform struct {
+	stubPlatformEngine
+	failMu    sync.Mutex
+	failCount int
+	failCtxs  []any
+}
+
+func (p *stubFailReactionPlatform) AddFailReaction(replyCtx any) {
+	p.failMu.Lock()
+	defer p.failMu.Unlock()
+	p.failCount++
+	p.failCtxs = append(p.failCtxs, replyCtx)
+}
+
+func (p *stubFailReactionPlatform) failSnapshot() (int, []any) {
+	p.failMu.Lock()
+	defer p.failMu.Unlock()
+	ctxs := make([]any, len(p.failCtxs))
+	copy(ctxs, p.failCtxs)
+	return p.failCount, ctxs
+}
+
 type stubAskQuestionRichCardPlatform struct {
 	stubCardPlatform
 }
@@ -1422,6 +1444,32 @@ func TestProcessInteractiveEvents_AddsDoneReactionAfterNormalReply(t *testing.T)
 	}
 	if len(ctxs) != 1 || ctxs[0] != "ctx-done" {
 		t.Fatalf("done reaction contexts = %#v, want [ctx-done]", ctxs)
+	}
+}
+
+func TestProcessInteractiveEvents_AddsFailReactionAfterEventError(t *testing.T) {
+	p := &stubFailReactionPlatform{stubPlatformEngine: stubPlatformEngine{n: "discord"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+	sessionKey := "discord:user-fail"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-fail")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-fail",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventError, Error: errors.New("boom")}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-fail", time.Now(), nil, nil, state.replyCtx)
+
+	count, ctxs := p.failSnapshot()
+	if count != 1 {
+		t.Fatalf("fail reactions = %d, want 1", count)
+	}
+	if len(ctxs) != 1 || ctxs[0] != "ctx-fail" {
+		t.Fatalf("fail reaction contexts = %#v, want [ctx-fail]", ctxs)
 	}
 }
 
@@ -3887,6 +3935,106 @@ func TestCmdCurrent_CustomNameOverridesSummary(t *testing.T) {
 	}
 	if strings.Contains(p.sent[0], "Agent summary") {
 		t.Fatalf("current text = %q, should not contain agent summary when custom name set", p.sent[0])
+	}
+}
+
+type stubLLMTitleAgent struct {
+	stubAgent
+	title string
+}
+
+func (a *stubLLMTitleAgent) GetLLMSessionTitle(sessionID string) string {
+	if sessionID == "session-llm" {
+		return a.title
+	}
+	return ""
+}
+
+type stubRenamePlatform struct {
+	stubPlatformEngine
+	titles []string
+	ctxs   []any
+}
+
+func (p *stubRenamePlatform) RenameSessionTitle(_ context.Context, replyCtx any, title string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.titles = append(p.titles, title)
+	p.ctxs = append(p.ctxs, replyCtx)
+	return nil
+}
+
+func TestMaybeRenameSessionTitle_UsesStreamedThenProvider(t *testing.T) {
+	p := &stubRenamePlatform{stubPlatformEngine: stubPlatformEngine{n: "discord"}}
+	agent := &stubLLMTitleAgent{title: "From disk"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	e.maybeRenameSessionTitle(p, "ctx-stream", agent, "session-llm", "Streamed title")
+	if len(p.titles) != 1 || p.titles[0] != "Streamed title" {
+		t.Fatalf("streamed titles = %#v", p.titles)
+	}
+
+	p.titles = nil
+	e.maybeRenameSessionTitle(p, "ctx-disk", agent, "session-llm", "")
+	if len(p.titles) != 1 || p.titles[0] != "From disk" {
+		t.Fatalf("provider titles = %#v", p.titles)
+	}
+
+	p.titles = nil
+	e.maybeRenameSessionTitle(p, "ctx-empty", agent, "other", "")
+	if len(p.titles) != 0 {
+		t.Fatalf("empty title should no-op, got %#v", p.titles)
+	}
+
+	plain := &stubPlatformEngine{n: "plain"}
+	e.maybeRenameSessionTitle(plain, "ctx", agent, "session-llm", "Nope")
+}
+
+func TestUnsolicitedReader_RenamesOnLateSessionTitle(t *testing.T) {
+	p := &stubRenamePlatform{stubPlatformEngine: stubPlatformEngine{n: "discord"}}
+	agent := &stubLLMTitleAgent{title: ""}
+	sess := newControllableSession("sess-late")
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+
+	sessions := e.sessions
+	session := sessions.GetOrCreateActive("test:ch_late:u1")
+	session.SetAgentSessionID("sess-late", agent.Name())
+
+	state := &interactiveState{
+		agentSession:     sess,
+		platform:         p,
+		replyCtx:         "ctx-late",
+		agent:            agent,
+		eventsNeedResync: false,
+	}
+	iKey := "test:ch_late:u1"
+	e.interactiveMu.Lock()
+	e.interactiveStates[iKey] = state
+	e.interactiveMu.Unlock()
+
+	e.startUnsolicitedReader(state, session, sessions, iKey, "")
+	defer e.stopUnsolicitedReader(state)
+
+	sess.events <- Event{Type: EventSessionTitle, Content: "Fix login button", SessionID: "sess-late"}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		p.mu.Lock()
+		n := len(p.titles)
+		got := append([]string(nil), p.titles...)
+		p.mu.Unlock()
+		if n > 0 {
+			if n != 1 || got[0] != "Fix login button" {
+				t.Fatalf("titles = %#v, want [Fix login button]", got)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("late EventSessionTitle did not rename the thread")
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 

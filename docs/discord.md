@@ -110,12 +110,19 @@ type = "discord"
 [projects.platforms.options]
 token = "MTk4NjIyNDgzNDcOTY3NDUxMg.G8vKqh.xxx..."
 # thread_isolation = true  # Optional: isolate each agent session in its own Discord thread
+# thread_require_mention = false  # Optional: keep @mention required inside threads (multi-bot)
+# reactions = true          # Optional: 👀/✅/❌ progress light on the user's message (default true)
+# reply_to_mode = "first"   # Optional: off | first | all (Hermes; default first)
 # progress_style = "legacy" # Optional: legacy | compact | card
 ```
 
 > cc-connect automatically configures the required Intents (MESSAGE_CONTENT, GUILD_MESSAGES, DIRECT_MESSAGES).
 > With `thread_isolation = true`, cc-connect creates or reuses a Discord thread for each session and routes follow-up messages by thread channel ID.
+> After **this bot** has participated in a thread (it opened the thread, or it replied there once), follow-ups in **that thread** do not need another `@mention`. This is independent of `multi-workspace` and is **not** `group_reply_all` — parent text channels stay mention-gated. Set `thread_require_mention = true` if several bots share one thread and each should fire only on `@mention`.
+> Threads this bot **just created** start with a placeholder name (the user's first message, mentions stripped). After the first agent turn, if Claude/Antigravity produces an LLM session title, jung-connect renames that thread — only while Discord still shows the placeholder. A human rename, a forum post the bot did not create, or a later title update is left alone.
 > `progress_style = "compact"` merges thinking/tool updates into one editable message; `progress_style = "card"` renders a Discord-native embed progress card and still sends the final answer as a normal message.
+> Progress light (default on, `reactions = true`): 👀 while working, ✅ on success, ❌ on failure. Cancel only removes 👀. The bot never reads reactions you add.
+> `reply_to_mode` (default `first`): the first chunk of each send is a Discord reply to your message, including inside `thread_isolation` threads. Later chunks in that send are not replies. `off` never replies; `all` replies on every chunk.
 
 ---
 
@@ -141,6 +148,7 @@ Under "Bot Permissions", check:
 | Create Public Threads | Create a new thread for a fresh agent session |
 | Send Messages in Threads | Send messages in threads |
 | Read Message History | Read message history |
+| Add Reactions | Progress light 👀/✅/❌ on the user's message |
 
 ### 6.4 Copy the Link
 
@@ -281,6 +289,24 @@ Check:
 2. Select your app → Bot
 3. Click "Reset Token"
 4. Update your config.toml
+
+### Q: Why does the bot ignore messages unless I @ it?
+
+Guild text channels require `@mention` unless `group_reply_all = true` (do **not** turn that on for public text channels — every message would be ingested, and with `thread_isolation` each one may become a thread).
+
+After **this bot** has participated in a thread (it opened the thread, replied there, answered a slash command there, or its own message was seen there), follow-ups **in that thread** do not need another `@mention`. This is independent of `multi-workspace`. Set `thread_require_mention = true` if several bots share one thread.
+
+Existing threads are not backfilled: after a deploy, @ once (or send a slash command) in that thread so the bot records participation.
+
+### Q: What are the 👀 / ✅ / ❌ reactions?
+
+The bot puts them on **your** message as a progress light (Hermes-style). 👀 while it works, ✅ when the turn succeeds, ❌ if it fails. Cancel only removes 👀. The bot does **not** read reactions you add. Needs the Add Reactions permission; set `reactions = false` to turn this off.
+
+`reply_to_mode` (default `first`) controls Discord "reply": the first chunk of each send references your message — including inside a `thread_isolation` thread. Later chunks in that send do not. `off` never replies; `all` replies on every chunk.
+
+### Q: Does the bot rename Discord threads?
+
+Yes, Hermes-style: only threads **this bot just opened**. The first name is a placeholder from the user's message. After the first turn, an LLM session title (Claude `ai-title`, Antigravity annotation title) replaces it — unless someone already renamed the thread. Forum posts and existing threads are not rewritten.
 
 ### Q: Bot has insufficient permissions?
 

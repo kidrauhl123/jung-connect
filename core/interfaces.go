@@ -221,6 +221,15 @@ type TypingIndicatorDone interface {
 	AddDoneReaction(replyCtx any)
 }
 
+// TypingIndicatorFail is an optional interface for platforms that can swap the
+// in-progress indicator for a failure mark (Hermes Discord ❌). The engine
+// calls AddFailReaction after EventError / a failed prompt send. Cancelled
+// turns must not implement a success or failure mark — StartTyping's stop
+// function already clears the in-progress indicator.
+type TypingIndicatorFail interface {
+	AddFailReaction(replyCtx any)
+}
+
 // AtMentionSender is an optional interface for platforms that support @mention in
 // reply messages (e.g. DingTalk). Platforms that implement this interface can
 // include @user notifications when replying in group chats.
@@ -559,6 +568,20 @@ type SessionDeleter interface {
 
 type SessionTitleProvider interface {
 	GetSessionTitle(sessionID string) string
+}
+
+// LLMSessionTitleProvider returns an agent-generated session title, not the
+// first-user-message fallback used by /list. Empty means no LLM title yet.
+type LLMSessionTitleProvider interface {
+	GetLLMSessionTitle(sessionID string) string
+}
+
+// SessionTitleRenamer is implemented by platforms that can rename an
+// auto-created conversation thread/topic from an LLM session title.
+// Implementations must no-op when this bot did not create the thread or
+// when a human already renamed it (Hermes-style no-clobber).
+type SessionTitleRenamer interface {
+	RenameSessionTitle(ctx context.Context, replyCtx any, title string) error
 }
 
 // WorkDirSwitcher is an optional interface for agents that support runtime

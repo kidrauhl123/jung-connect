@@ -72,6 +72,16 @@ type claudeSession struct {
 	// when the session reuses the shared file (the common 99% case)
 	// or when there is nothing to append.
 	promptFilePath string
+
+	// titleClient names the session once. Claude Code 2.1+ print/stream-json
+	// no longer emits ai-title; cc-connect generates the LLM title itself.
+	titleClient sessionTitleClient
+	titled      atomic.Bool
+}
+
+// sessionTitleClient generates a short LLM session title from the first user prompt.
+type sessionTitleClient interface {
+	GenerateTitle(ctx context.Context, prompt string) (string, error)
 }
 
 // StartupWarning implements core.StartupWarner. Returns a non-empty string
@@ -490,6 +500,9 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 		ccHooks:             newCCPermissionHookRunner(workDir),
 		startupWarning:      rootDowngradeWarning,
 		promptFilePath:      cleanupPromptPath,
+		// Title HTTP runs in cc-connect, not the isolated child. Use extraEnv
+		// (provider keys) so run_as_user stripping the child env cannot blank the client.
+		titleClient: newEnvSessionTitleClient(extraEnv),
 	}
 	cs.setPermissionMode(mode)
 	cs.sessionID.Store(sessionID)
@@ -615,6 +628,8 @@ func (cs *claudeSession) handleReadLoopLine(line string) {
 		cs.handleUser(raw)
 	case "result":
 		cs.handleResult(raw)
+	case "ai-title":
+		cs.handleAITitle(raw)
 	case "control_request":
 		cs.handleControlRequest(raw)
 	case "control_cancel_request":
@@ -646,6 +661,28 @@ func resultSubtype(raw map[string]any) string {
 		return s
 	}
 	return ""
+}
+
+func (cs *claudeSession) handleAITitle(raw map[string]any) {
+	title, _ := raw["aiTitle"].(string)
+	if title == "" {
+		title, _ = raw["title"].(string)
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return
+	}
+	cs.titled.Store(true)
+	if sid, ok := raw["session_id"].(string); ok && sid != "" {
+		cs.sessionID.Store(sid)
+	} else if sid, ok := raw["sessionId"].(string); ok && sid != "" {
+		cs.sessionID.Store(sid)
+	}
+	evt := core.Event{Type: core.EventSessionTitle, Content: title, SessionID: cs.CurrentSessionID()}
+	select {
+	case cs.events <- evt:
+	case <-cs.ctx.Done():
+	}
 }
 
 func (cs *claudeSession) handleSystem(raw map[string]any) {
@@ -988,10 +1025,14 @@ func (cs *claudeSession) Send(prompt string, messageID string, images []core.Ima
 	}
 
 	if len(images) == 0 && len(files) == 0 {
-		return cs.writeJSON(map[string]any{
+		if err := cs.writeJSON(map[string]any{
 			"type":    "user",
 			"message": map[string]any{"role": "user", "content": prompt},
-		})
+		}); err != nil {
+			return err
+		}
+		cs.maybeGenerateSessionTitle(prompt)
+		return nil
 	}
 
 	attachDir := filepath.Join(cs.workDir, ".cc-connect", "attachments")
@@ -1046,10 +1087,14 @@ func (cs *claudeSession) Send(prompt string, messageID string, images []core.Ima
 	}
 	parts = append(parts, map[string]any{"type": "text", "text": textPart})
 
-	return cs.writeJSON(map[string]any{
+	if err := cs.writeJSON(map[string]any{
 		"type":    "user",
 		"message": map[string]any{"role": "user", "content": parts},
-	})
+	}); err != nil {
+		return err
+	}
+	cs.maybeGenerateSessionTitle(prompt)
+	return nil
 }
 
 // RespondPermission writes a control_response to the Claude process stdin.

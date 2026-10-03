@@ -4864,6 +4864,15 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 			state.mu.Unlock()
 
 			switch event.Type {
+			case EventSessionTitle:
+				if event.Content != "" {
+					replyAgent := state.agent
+					if replyAgent == nil {
+						replyAgent = e.agent
+					}
+					e.maybeRenameSessionTitle(p, replyCtx, replyAgent, session.GetAgentSessionID(), event.Content)
+				}
+
 			case EventText:
 				if event.Content != "" {
 					textParts = append(textParts, event.Content)
@@ -5019,16 +5028,23 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	var partialText string
 	triggerAutoCompress := false
 	pendingSend := sendDone
+	sessionTitle := ""
 
 	// stopTyping tracks the current turn's typing indicator so it can be
 	// stopped when a queued message starts a new turn.
 	stopTyping := stopTypingFn
-	// doneReaction stores a function to add a "done" emoji after stopTyping.
-	// Set during EventResult handling for multi-round quiet turns.
+	// doneReaction / failReaction run after stopTyping so the in-progress
+	// mark (👀) is cleared before ✅ / ❌ is added. Cancelled turns leave
+	// both nil — stopTyping still runs.
 	var doneReaction func()
+	var failReaction func()
 	defer func() {
 		if stopTyping != nil {
 			stopTyping()
+		}
+		if failReaction != nil {
+			failReaction()
+			return
 		}
 		if doneReaction != nil {
 			doneReaction()
@@ -5118,10 +5134,6 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if err != nil {
 				slog.Error("failed to send prompt", "error", err, "session_key", sessionKey)
 				sp.discard()
-				if stopTyping != nil {
-					stopTyping()
-					stopTyping = nil
-				}
 				e.notifyDroppedQueuedMessages(state, err)
 				if state.agentSession == nil || !state.agentSession.Alive() {
 					e.cleanupInteractiveState(sessionKey, state)
@@ -5130,6 +5142,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				p := state.platform
 				state.mu.Unlock()
 				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+				if failTI, ok := p.(TypingIndicatorFail); ok {
+					failReaction = func() { failTI.AddFailReaction(replyCtx) }
+				}
 				return
 			}
 			continue
@@ -5143,6 +5158,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			p := state.platform
 			state.mu.Unlock()
 			e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent session timed out (no response)"))
+			if failTI, ok := p.(TypingIndicatorFail); ok {
+				failReaction = func() { failTI.AddFailReaction(replyCtx) }
+			}
 			e.cleanupInteractiveState(sessionKey, state)
 			return
 		case <-turnDeadlineCh:
@@ -5156,6 +5174,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.mu.Unlock()
 			e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError),
 				fmt.Sprintf("agent turn exceeded maximum time (%v), stopping", e.maxTurnTime)))
+			if failTI, ok := p.(TypingIndicatorFail); ok {
+				failReaction = func() { failTI.AddFailReaction(replyCtx) }
+			}
 
 			// Two-phase shutdown: first try a graceful stop so the agent can
 			// write its final state before dying (preserves --resume ability).
@@ -5251,6 +5272,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		}
 
 		switch event.Type {
+		case EventSessionTitle:
+			if event.Content != "" {
+				sessionTitle = event.Content
+			}
 		case EventThinking:
 			if isEllipsisOnly(event.Content) {
 				break
@@ -5794,6 +5819,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					sessions.Save()
 				}
 			}
+			e.maybeRenameSessionTitle(p, replyCtx, replyAgent, session.GetAgentSessionID(), sessionTitle)
 
 			// Mark clean exit so unsolicited reader preserves buffered events.
 			state.mu.Lock()
@@ -6176,8 +6202,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if ti, ok := queued.platform.(TypingIndicator); ok {
 					stopTyping = ti.StartTyping(e.ctx, queued.replyCtx)
 				}
-				// Agent continues working — don't add done reaction for this turn.
+				// Agent continues working — don't add done/fail reaction for this turn.
 				doneReaction = nil
+				failReaction = nil
 
 				// Drain stale events before starting the next turn. Between
 				// EventResult and Send(), the only buffered events would be
@@ -6215,6 +6242,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				textParts = nil
 				segmentStart = 0
 				toolCount = 0
+				sessionTitle = ""
 				turnStart = time.Now()
 				firstEventLogged = false
 				waitStart = time.Now()
@@ -6341,6 +6369,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// while keeping the session alive for subsequent turns.
 			if state.agentSession == nil || !state.agentSession.Alive() {
 				e.notifyDroppedQueuedMessages(state, event.Error)
+			}
+			if !hasRichCard {
+				if failTI, ok := p.(TypingIndicatorFail); ok {
+					failReaction = func() { failTI.AddFailReaction(replyCtx) }
+				}
 			}
 			return
 		}
@@ -10049,7 +10082,6 @@ func (e *Engine) switchModel(target string) (string, error) {
 	return e.switchModelOnAgent(e.agent, target, e.shouldPersistModelConfig(e.agent))
 }
 
-
 // applyRuntimeModelOnAgent updates an agent's in-memory model and active
 // provider model without touching project config. Used when creating
 // workspace agents so opts["model"] / WorkspaceModelOverride survive
@@ -13636,6 +13668,28 @@ func (e *Engine) currentSessionDisplayName(agent Agent, sessions *SessionManager
 		return e.i18n.T(MsgUntitled)
 	}
 	return displayName
+}
+
+// maybeRenameSessionTitle applies an LLM session title to a platform thread
+// (Hermes-style Discord auto-thread rename). Platforms that did not create
+// the thread, or whose placeholder name was already changed, no-op.
+func (e *Engine) maybeRenameSessionTitle(p Platform, replyCtx any, agent Agent, agentSessionID, streamedTitle string) {
+	renamer, ok := p.(SessionTitleRenamer)
+	if !ok {
+		return
+	}
+	title := strings.TrimSpace(streamedTitle)
+	if title == "" && agentSessionID != "" {
+		if tp, ok := agent.(LLMSessionTitleProvider); ok {
+			title = strings.TrimSpace(tp.GetLLMSessionTitle(agentSessionID))
+		}
+	}
+	if title == "" {
+		return
+	}
+	if err := renamer.RenameSessionTitle(e.ctx, replyCtx, title); err != nil {
+		slog.Debug("session title rename failed", "error", err)
+	}
 }
 
 func (e *Engine) renderCurrentCard(sessionKey string) *Card {

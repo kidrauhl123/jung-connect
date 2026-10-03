@@ -576,6 +576,30 @@ func (a *Agent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, erro
 	return sessions, nil
 }
 
+func (a *Agent) GetLLMSessionTitle(sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || strings.Contains(sessionID, "/") || strings.Contains(sessionID, "\\") || sessionID == "." || sessionID == ".." {
+		return ""
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	a.mu.RLock()
+	workDir := a.workDir
+	a.mu.RUnlock()
+	absWorkDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return ""
+	}
+	projectDir := findProjectDir(homeDir, absWorkDir)
+	if projectDir == "" {
+		return ""
+	}
+	aiTitle, _, _, _ := scanSessionTitles(filepath.Join(projectDir, sessionID+".jsonl"))
+	return strings.TrimSpace(stripXMLTags(aiTitle))
+}
+
 func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -613,19 +637,31 @@ func extractStringContent(raw json.RawMessage) string {
 }
 
 func scanSessionMeta(path string) (string, int) {
+	aiTitle, customTitle, firstUser, count := scanSessionTitles(path)
+	summary := customTitle
+	if summary == "" {
+		summary = aiTitle
+	}
+	if summary == "" {
+		summary = firstUser
+	}
+	summary = stripXMLTags(summary)
+	summary = strings.TrimSpace(summary)
+	if utf8.RuneCountInString(summary) > 40 {
+		summary = string([]rune(summary)[:40]) + "..."
+	}
+	return summary, count
+}
+
+func scanSessionTitles(path string) (aiTitle, customTitle, firstUser string, count int) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", 0
+		return "", "", "", 0
 	}
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 256*1024), 256*1024)
-
-	var firstUserMessage string
-	var aiTitle string
-	var customTitle string
-	var count int
 
 	for scanner.Scan() {
 		var entry struct {
@@ -650,27 +686,14 @@ func scanSessionMeta(path string) (string, int) {
 			}
 		case "user", "assistant":
 			count++
-			if entry.Type == "user" && firstUserMessage == "" {
+			if entry.Type == "user" && firstUser == "" {
 				if s := extractStringContent(entry.Message.Content); s != "" {
-					firstUserMessage = s
+					firstUser = s
 				}
 			}
 		}
 	}
-
-	summary := customTitle
-	if summary == "" {
-		summary = aiTitle
-	}
-	if summary == "" {
-		summary = firstUserMessage
-	}
-	summary = stripXMLTags(summary)
-	summary = strings.TrimSpace(summary)
-	if utf8.RuneCountInString(summary) > 40 {
-		summary = string([]rune(summary)[:40]) + "..."
-	}
-	return summary, count
+	return aiTitle, customTitle, firstUser, count
 }
 
 var xmlTagRe = regexp.MustCompile(`<[^>]+>`)

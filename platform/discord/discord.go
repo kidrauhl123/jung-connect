@@ -3,14 +3,19 @@ package discord
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"github.com/chenhg5/cc-connect/core"
 
@@ -28,6 +33,14 @@ type replyContext struct {
 	channelID string
 	messageID string
 	threadID  string
+	// sourceChannelID is the channel that owns messageID (parent, when a
+	// thread was just created from that message). Reactions and reply
+	// references must use this, not the send target.
+	sourceChannelID string
+	// autoThreadInitialName is the placeholder name used when this bot
+	// created the thread. Semantic rename only proceeds while Discord
+	// still shows this name (a human rename is left alone).
+	autoThreadInitialName string
 }
 
 // interactionReplyCtx handles Discord slash command (Application Command)
@@ -52,7 +65,10 @@ type Platform struct {
 	groupReplyAllGuilds        []string // guild IDs where groupReplyAll is active; "*" = all guilds
 	shareSessionInChannel      bool
 	threadIsolation            bool
+	threadRequireMention       bool // if true, threads stay gated like channels (multi-bot)
 	respondToAtEveryoneAndHere bool
+	reactions                  bool   // Hermes-style 👀/✅/❌ on the user's message
+	replyToMode                string // off | first | all (Hermes Discord reply_to_mode)
 	proxyURL                   *url.URL
 	handler                    core.MessageHandler
 	botID                      string
@@ -63,6 +79,9 @@ type Platform struct {
 	seenMsgs                   sync.Map // message ID dedup: prevents duplicate MessageCreate events
 	seenInteractions           sync.Map // interaction ID dedup: prevents duplicate slash/button events
 	self                       core.Platform
+	participatedThreads        participatedThreadSet
+	threadStorePath            string
+	autoThreadPlaceholders     sync.Map // threadID -> placeholder name used at create
 
 	mu               sync.RWMutex
 	session          *discordgo.Session
@@ -97,8 +116,17 @@ func New(opts map[string]any) (core.Platform, error) {
 	}
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	threadIsolation, _ := opts["thread_isolation"].(bool)
+	threadRequireMention, _ := opts["thread_require_mention"].(bool)
 	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
-	// Default to "compact" so streaming edits work out of the box (Discord
+	reactions := true
+	if v, ok := opts["reactions"].(bool); ok {
+		reactions = v
+	}
+	replyToMode, err := parseDiscordReplyToMode(opts["reply_to_mode"])
+	if err != nil {
+		return nil, err
+	}
+	// Default to "compact" so streaming edits work out of the box (Discord)
 	// supports MessageUpdater.UpdateMessage). Users can opt back into the old
 	// "send entire reply at once" behavior with progress_style = "legacy".
 	progressStyle := "compact"
@@ -137,9 +165,14 @@ func New(opts map[string]any) (core.Platform, error) {
 		shareSessionInChannel:      shareSessionInChannel,
 		readyCh:                    make(chan struct{}),
 		threadIsolation:            threadIsolation,
+		threadRequireMention:       threadRequireMention,
 		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
+		reactions:                  reactions,
+		replyToMode:                replyToMode,
 		proxyURL:                   proxyU,
+		threadStorePath:            participatedThreadStorePath(opts),
 	}
+	base.loadParticipatedThreads()
 	if progressStyle == "compact" || progressStyle == "card" {
 		wrapped := &progressPlatform{Platform: base}
 		base.self = wrapped
@@ -191,6 +224,218 @@ func (p *Platform) isGroupReplyAllGuild(guildID string) bool {
 	return false
 }
 
+const maxParticipatedThreads = 500
+
+type participatedThreadSet struct {
+	mu    sync.Mutex
+	ids   map[string]struct{}
+	order []string
+}
+
+func participatedThreadStorePath(opts map[string]any) string {
+	dataDir, _ := opts["cc_data_dir"].(string)
+	project, _ := opts["cc_project"].(string)
+	if strings.TrimSpace(dataDir) == "" {
+		return ""
+	}
+	name := strings.TrimSpace(project)
+	if name == "" {
+		name = "default"
+	}
+	return filepath.Join(dataDir, "discord_participated_threads_"+name+".json")
+}
+
+func (p *Platform) loadParticipatedThreads() {
+	if p == nil {
+		return
+	}
+	p.participatedThreads.ids = make(map[string]struct{})
+	if p.threadStorePath == "" {
+		return
+	}
+	data, err := os.ReadFile(p.threadStorePath)
+	if err != nil {
+		return
+	}
+	var ids []string
+	if err := json.Unmarshal(data, &ids); err != nil {
+		slog.Debug("discord: load participated threads failed", "path", p.threadStorePath, "error", err)
+		return
+	}
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := p.participatedThreads.ids[id]; ok {
+			continue
+		}
+		p.participatedThreads.ids[id] = struct{}{}
+		p.participatedThreads.order = append(p.participatedThreads.order, id)
+	}
+	p.trimParticipatedThreadsLocked()
+}
+
+func (p *Platform) trimParticipatedThreadsLocked() {
+	for len(p.participatedThreads.order) > maxParticipatedThreads {
+		old := p.participatedThreads.order[0]
+		p.participatedThreads.order = p.participatedThreads.order[1:]
+		delete(p.participatedThreads.ids, old)
+	}
+}
+
+func (p *Platform) markParticipatedThread(threadID string) {
+	threadID = strings.TrimSpace(threadID)
+	if p == nil || threadID == "" {
+		return
+	}
+	p.participatedThreads.mu.Lock()
+	if p.participatedThreads.ids == nil {
+		p.participatedThreads.ids = make(map[string]struct{})
+	}
+	if _, ok := p.participatedThreads.ids[threadID]; ok {
+		p.participatedThreads.mu.Unlock()
+		return
+	}
+	p.participatedThreads.ids[threadID] = struct{}{}
+	p.participatedThreads.order = append(p.participatedThreads.order, threadID)
+	p.trimParticipatedThreadsLocked()
+	snapshot := append([]string(nil), p.participatedThreads.order...)
+	path := p.threadStorePath
+	p.participatedThreads.mu.Unlock()
+	p.persistParticipatedThreads(path, snapshot)
+}
+
+func (p *Platform) persistParticipatedThreads(path string, ids []string) {
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		slog.Debug("discord: persist participated threads mkdir failed", "path", path, "error", err)
+		return
+	}
+	data, err := json.Marshal(ids)
+	if err != nil {
+		slog.Debug("discord: persist participated threads marshal failed", "error", err)
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		slog.Debug("discord: persist participated threads write failed", "path", tmp, "error", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		slog.Debug("discord: persist participated threads rename failed", "path", path, "error", err)
+	}
+}
+
+func (p *Platform) hasParticipatedInThread(threadID string) bool {
+	if p == nil || threadID == "" {
+		return false
+	}
+	p.participatedThreads.mu.Lock()
+	defer p.participatedThreads.mu.Unlock()
+	_, ok := p.participatedThreads.ids[threadID]
+	return ok
+}
+
+func (p *Platform) rememberAutoThreadPlaceholder(threadID, name string) {
+	threadID = strings.TrimSpace(threadID)
+	name = strings.TrimSpace(name)
+	if p == nil || threadID == "" || name == "" {
+		return
+	}
+	p.autoThreadPlaceholders.Store(threadID, name)
+}
+
+func (p *Platform) autoThreadPlaceholder(threadID string) string {
+	if p == nil || threadID == "" {
+		return ""
+	}
+	v, ok := p.autoThreadPlaceholders.Load(threadID)
+	if !ok {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
+func (p *Platform) forgetAutoThreadPlaceholder(threadID string) {
+	if p == nil || threadID == "" {
+		return
+	}
+	p.autoThreadPlaceholders.Delete(threadID)
+}
+
+func (p *Platform) attachAutoThreadPlaceholder(rc replyContext) replyContext {
+	if rc.autoThreadInitialName != "" {
+		if rc.threadID != "" {
+			p.rememberAutoThreadPlaceholder(rc.threadID, rc.autoThreadInitialName)
+		}
+		return rc
+	}
+	threadID := rc.threadID
+	if threadID == "" {
+		threadID = rc.channelID
+	}
+	if name := p.autoThreadPlaceholder(threadID); name != "" {
+		rc.autoThreadInitialName = name
+	}
+	return rc
+}
+
+// guildMessageSkipsMention is true when a guild message should be admitted
+// without @mention: group_reply_all, or a thread this bot already joined
+// (Hermes-style in-thread shortcut). thread_require_mention disables the
+// shortcut so multi-bot threads stay mention-gated.
+//
+// Participation is keyed by Discord channel ID. Parent text channels are
+// never stored, so a set lookup is enough — no REST Channel GET on the
+// unmentioned hot path.
+func (p *Platform) guildMessageSkipsMention(guildID, channelID string, _ discordThreadOps) bool {
+	if p.isGroupReplyAllGuild(guildID) {
+		return true
+	}
+	if p.threadRequireMention || channelID == "" {
+		return false
+	}
+	return p.hasParticipatedInThread(channelID)
+}
+
+func (p *Platform) recordThreadParticipation(channelID, threadID string, ops discordThreadOps) {
+	if threadID != "" {
+		p.markParticipatedThread(threadID)
+		return
+	}
+	if channelID == "" || ops == nil {
+		return
+	}
+	ch, err := ops.ResolveChannel(channelID)
+	if err != nil || ch == nil || !isThreadChannelType(ch.Type) {
+		return
+	}
+	p.markParticipatedThread(ch.ID)
+}
+
+// recordKnownThreadParticipation marks a thread without hitting Discord REST.
+// Outbound send paths use this so unit tests that stub ChannelMessageSend
+// are not forced to also stub Channel GET. Inbound handlers still resolve.
+func (p *Platform) recordKnownThreadParticipation(channelID, threadID string) {
+	if threadID != "" {
+		p.markParticipatedThread(threadID)
+		return
+	}
+	if p == nil || p.session == nil || channelID == "" {
+		return
+	}
+	ch, err := p.session.State.Channel(channelID)
+	if err != nil || ch == nil || !isThreadChannelType(ch.Type) {
+		return
+	}
+	p.markParticipatedThread(ch.ID)
+}
+
 func (p *Platform) makeSessionKey(channelID string, userID string) string {
 	return buildSessionKey(channelID, userID, p.shareSessionInChannel)
 }
@@ -218,6 +463,28 @@ func buildThreadSessionKey(threadID string) string {
 	return fmt.Sprintf("discord:%s", threadID)
 }
 
+func parseDiscordReplyToMode(v any) (string, error) {
+	s, _ := v.(string)
+	s = strings.ToLower(strings.TrimSpace(s))
+	switch s {
+	case "", "first":
+		return "first", nil
+	case "off", "all":
+		return s, nil
+	default:
+		return "", fmt.Errorf("discord: invalid reply_to_mode %q (want off, first, or all)", s)
+	}
+}
+
+func newReplyContext(channelID, messageID, threadID, sourceChannelID string) replyContext {
+	return replyContext{
+		channelID:       channelID,
+		messageID:       messageID,
+		threadID:        threadID,
+		sourceChannelID: sourceChannelID,
+	}
+}
+
 func (rc replyContext) targetChannelID() string {
 	if rc.threadID != "" {
 		return rc.threadID
@@ -225,8 +492,48 @@ func (rc replyContext) targetChannelID() string {
 	return rc.channelID
 }
 
-func (rc replyContext) useThreadChannel() bool {
-	return rc.threadID != "" && rc.threadID == rc.channelID
+func (rc replyContext) reactionChannelID() string {
+	if rc.sourceChannelID != "" {
+		return rc.sourceChannelID
+	}
+	return rc.targetChannelID()
+}
+
+func (rc replyContext) messageReference() *discordgo.MessageReference {
+	if rc.messageID == "" {
+		return nil
+	}
+	failIfNotExists := false
+	return &discordgo.MessageReference{
+		MessageID:       rc.messageID,
+		ChannelID:       rc.reactionChannelID(),
+		FailIfNotExists: &failIfNotExists,
+	}
+}
+
+func (rc replyContext) referenceForChunk(mode string, index int) *discordgo.MessageReference {
+	switch mode {
+	case "all":
+		return rc.messageReference()
+	case "first":
+		if index == 0 {
+			return rc.messageReference()
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+func isDiscordReplyReferenceRejected(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	if strings.Contains(text, "10008") {
+		return true
+	}
+	return strings.Contains(text, "50035") && strings.Contains(strings.ToLower(text), "system message")
 }
 
 type discordThreadOps interface {
@@ -282,32 +589,55 @@ func isThreadChannelType(t discordgo.ChannelType) bool {
 	}
 }
 
-func truncateDiscordThreadName(s string, maxRunes int) string {
-	runes := []rune(s)
-	if len(runes) <= maxRunes {
+func utf16Len(s string) int {
+	return len(utf16.Encode([]rune(s)))
+}
+
+func prefixWithinUTF16Limit(s string, limit int) string {
+	if utf16Len(s) <= limit {
 		return s
 	}
-	return string(runes[:maxRunes])
+	runes := []rune(s)
+	lo, hi := 0, len(runes)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if utf16Len(string(runes[:mid])) <= limit {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return string(runes[:lo])
 }
+
+func sanitizeDiscordThreadTitle(title string) string {
+	cleaned := strings.Join(strings.Fields(strings.ReplaceAll(title, "\n", " ")), " ")
+	if cleaned == "" {
+		return "cc session"
+	}
+	if utf16Len(cleaned) <= 80 {
+		return cleaned
+	}
+	return strings.TrimRight(prefixWithinUTF16Limit(cleaned, 77), " ") + "..."
+}
+
+var discordMentionToken = regexp.MustCompile(`<@!?[0-9]+>|<@&[0-9]+>|<#\d+>`)
 
 func threadNameForMessage(m *discordgo.MessageCreate, botID string) string {
 	name := stripDiscordMention(m.Content, botID)
+	name = discordMentionToken.ReplaceAllString(name, "")
 	name = strings.Join(strings.Fields(strings.ReplaceAll(name, "\n", " ")), " ")
 	if name == "" && m.Author != nil {
 		name = "cc " + m.Author.Username
 	}
-	if name == "" {
-		name = "cc session"
-	}
-	return truncateDiscordThreadName(name, 90)
+	return sanitizeDiscordThreadTitle(name)
 }
 
 func freshThreadName(title string) string {
-	name := strings.Join(strings.Fields(strings.ReplaceAll(title, "\n", " ")), " ")
-	if name == "" {
-		name = "cc cron"
+	if strings.TrimSpace(title) == "" {
+		return "cc cron"
 	}
-	return truncateDiscordThreadName(name, 90)
+	return sanitizeDiscordThreadTitle(title)
 }
 
 func standaloneThreadType(parentType discordgo.ChannelType) (discordgo.ChannelType, bool) {
@@ -390,7 +720,7 @@ func resolveThreadReplyContext(m *discordgo.MessageCreate, botID string, ops dis
 		if err := ops.JoinThread(m.ChannelID); err != nil {
 			slog.Debug("discord: join existing thread failed", "thread", m.ChannelID, "error", err)
 		}
-		rc := replyContext{channelID: m.ChannelID, messageID: m.ID, threadID: m.ChannelID}
+		rc := newReplyContext(m.ChannelID, m.ID, m.ChannelID, m.ChannelID)
 		return buildThreadSessionKey(m.ChannelID), rc, parentChannelID, nil
 	}
 	if m.Message != nil && m.Message.Thread != nil && m.Message.Thread.ID != "" {
@@ -398,7 +728,7 @@ func resolveThreadReplyContext(m *discordgo.MessageCreate, botID string, ops dis
 		if err := ops.JoinThread(threadID); err != nil {
 			slog.Debug("discord: join attached thread failed", "thread", threadID, "error", err)
 		}
-		rc := replyContext{channelID: threadID, messageID: m.ID, threadID: threadID}
+		rc := newReplyContext(threadID, m.ID, threadID, m.ChannelID)
 		return buildThreadSessionKey(threadID), rc, m.ChannelID, nil
 	}
 	if m.Flags&discordgo.MessageFlagsHasThread != 0 {
@@ -406,18 +736,20 @@ func resolveThreadReplyContext(m *discordgo.MessageCreate, botID string, ops dis
 		if err := ops.JoinThread(threadID); err != nil {
 			slog.Debug("discord: join message thread failed", "thread", threadID, "error", err)
 		}
-		rc := replyContext{channelID: threadID, messageID: m.ID, threadID: threadID}
+		rc := newReplyContext(threadID, m.ID, threadID, m.ChannelID)
 		return buildThreadSessionKey(threadID), rc, m.ChannelID, nil
 	}
 
-	thread, err := ops.StartThread(m.ChannelID, m.ID, threadNameForMessage(m, botID), 1440)
+	threadName := threadNameForMessage(m, botID)
+	thread, err := ops.StartThread(m.ChannelID, m.ID, threadName, 1440)
 	if err != nil {
 		return "", replyContext{}, "", fmt.Errorf("start thread for message %s: %w", m.ID, err)
 	}
 	if err := ops.JoinThread(thread.ID); err != nil {
 		slog.Debug("discord: join new thread failed", "thread", thread.ID, "error", err)
 	}
-	rc := replyContext{channelID: thread.ID, messageID: m.ID, threadID: thread.ID}
+	rc := newReplyContext(thread.ID, m.ID, thread.ID, m.ChannelID)
+	rc.autoThreadInitialName = threadName
 	return buildThreadSessionKey(thread.ID), rc, m.ChannelID, nil
 }
 
@@ -609,6 +941,9 @@ func (p *Platform) buildSession() (*discordgo.Session, error) {
 		}
 
 		if m.Author.Bot || m.Author.ID == p.botID {
+			if m.Author.ID == p.botID && m.GuildID != "" {
+				p.recordThreadParticipation(m.ChannelID, "", sessionThreadOps{session: p.session})
+			}
 			return
 		}
 		if core.IsOldMessage(m.Timestamp) {
@@ -620,19 +955,22 @@ func (p *Platform) buildSession() (*discordgo.Session, error) {
 			return
 		}
 
-		// In guild channels, only respond when the bot is @mentioned (unless group_reply_all).
-		// Check both user mentions and role mentions (Discord auto-creates a managed role
-		// for each bot; users may @ the role instead of the user).
+		// In guild channels, only respond when the bot is @mentioned (unless
+		// group_reply_all, or this is a thread the bot already participated in).
+		// Check both user mentions and role mentions (Discord auto-creates a
+		// managed role for each bot; users may @ the role instead of the user).
 		botRoleID := p.botRoleIDForGuild(m.GuildID)
 		if botRoleID == "" && m.GuildID != "" {
 			p.cacheBotRoleIDForGuild(s, m.GuildID, nil)
 			botRoleID = p.botRoleIDForGuild(m.GuildID)
 		}
-		if m.GuildID != "" && !p.isGroupReplyAllGuild(m.GuildID) {
-			if !isDiscordBotMention(m, p.botID, botRoleID, p.respondToAtEveryoneAndHere) {
-				slog.Debug("discord: ignoring guild message without bot mention", "channel", m.ChannelID)
-				return
-			}
+		threadOps := sessionThreadOps{session: p.session}
+		mentioned := isDiscordBotMention(m, p.botID, botRoleID, p.respondToAtEveryoneAndHere)
+		if m.GuildID != "" && !mentioned && !p.guildMessageSkipsMention(m.GuildID, m.ChannelID, threadOps) {
+			slog.Debug("discord: ignoring guild message without bot mention", "channel", m.ChannelID)
+			return
+		}
+		if mentioned {
 			m.Content = stripDiscordMentionWithRole(m.Content, p.botID, botRoleID)
 			if m.MentionEveryone {
 				m.Content = stripEveryoneHere(m.Content)
@@ -642,7 +980,7 @@ func (p *Platform) buildSession() (*discordgo.Session, error) {
 		slog.Debug("discord: message received", "user", m.Author.Username, "channel", m.ChannelID)
 
 		sessionKey := p.makeSessionKey(m.ChannelID, m.Author.ID)
-		rctx := replyContext{channelID: m.ChannelID, messageID: m.ID}
+		rctx := newReplyContext(m.ChannelID, m.ID, "", m.ChannelID)
 		// channelKey pins workspace binding to the parent channel even when
 		// thread_isolation rewrites SessionKey to a thread ID. Without it,
 		// effectiveChannelID() would extract the thread ID from SessionKey
@@ -651,12 +989,12 @@ func (p *Platform) buildSession() (*discordgo.Session, error) {
 		// (the historical, non-isolated behavior).
 		channelKey := ""
 		if p.threadIsolation && m.GuildID != "" {
-			threadSessionKey, threadCtx, parentChannelID, err := resolveThreadReplyContext(m, p.botID, sessionThreadOps{session: p.session})
+			threadSessionKey, threadCtx, parentChannelID, err := resolveThreadReplyContext(m, p.botID, threadOps)
 			if err != nil {
 				slog.Warn("discord: thread isolation setup failed, falling back", "message", m.ID, "channel", m.ChannelID, "error", err)
 			} else {
 				sessionKey = threadSessionKey
-				rctx = threadCtx
+				rctx = p.attachAutoThreadPlaceholder(threadCtx)
 				channelKey = parentChannelID
 			}
 		}
@@ -680,6 +1018,7 @@ func (p *Platform) buildSession() (*discordgo.Session, error) {
 			Content: m.Content, Images: images, Files: files, Audio: audio, ReplyCtx: rctx,
 		}
 		msg.ChatName, _ = p.ResolveChannelName(m.ChannelID)
+		p.recordThreadParticipation(m.ChannelID, rctx.threadID, threadOps)
 		p.dispatchMessage(msg)
 	})
 
@@ -851,6 +1190,7 @@ func (p *Platform) handleInteraction(s *discordgo.Session, i *discordgo.Interact
 		Content: cmdText, ReplyCtx: rctx,
 	}
 	msg.ChatName, _ = p.ResolveChannelName(channelID)
+	p.recordThreadParticipation(channelID, "", ops)
 	p.dispatchMessage(msg)
 }
 
@@ -861,12 +1201,10 @@ func replyContextForDeferredInteractionFallback(ch *discordgo.Channel, channelID
 	if ch == nil {
 		return replyContext{channelID: channelID}
 	}
-	switch ch.Type {
-	case discordgo.ChannelTypeGuildPublicThread, discordgo.ChannelTypeGuildPrivateThread:
+	if isThreadChannelType(ch.Type) {
 		return replyContext{channelID: channelID, threadID: channelID}
-	default:
-		return replyContext{channelID: channelID}
 	}
+	return replyContext{channelID: channelID}
 }
 
 // reconstructCommand converts a Discord interaction back to a text command string
@@ -921,6 +1259,7 @@ func (p *Platform) handleComponentInteraction(s *discordgo.Session, i *discordgo
 		rc.messageID = i.Message.ID
 	}
 	chatName, _ := p.ResolveChannelName(channelID)
+	p.recordThreadParticipation(channelID, "", ops)
 	p.dispatchMessage(&core.Message{
 		SessionKey:           sessionKey,
 		ChannelKey:           channelKey,
@@ -955,19 +1294,20 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 	case *interactionReplyCtx:
 		return p.sendInteraction(rc, content)
 	case replyContext:
-		return p.sendChannelReply(rc, content)
+		return p.sendChannelMessages(rc, content)
 	default:
 		return fmt.Errorf("discord: invalid reply context type %T", rctx)
 	}
 }
 
-// Send sends a new message (not a reply).
+// Send delivers a channel message. Hermes reply_to_mode applies here too:
+// the engine's final answer uses Send, not Reply.
 func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	switch rc := rctx.(type) {
 	case *interactionReplyCtx:
 		return p.sendInteraction(rc, content)
 	case replyContext:
-		return p.sendChannel(rc, content)
+		return p.sendChannelMessages(rc, content)
 	default:
 		return fmt.Errorf("discord: invalid reply context type %T", rctx)
 	}
@@ -977,6 +1317,9 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 // mechanism. The first call edits the deferred "thinking" response; subsequent
 // calls create followup messages.
 func (p *Platform) sendInteraction(ictx *interactionReplyCtx, content string) error {
+	if ictx != nil {
+		p.recordKnownThreadParticipation(ictx.channelID, "")
+	}
 	chunks := core.SplitMessageCodeFenceAware(wrapTablesInCodeBlocks(content), maxDiscordLen)
 	for _, chunk := range chunks {
 		ictx.mu.Lock()
@@ -1005,32 +1348,55 @@ func (p *Platform) sendInteraction(ictx *interactionReplyCtx, content string) er
 	return nil
 }
 
+func (p *Platform) effectiveReplyToMode() string {
+	switch p.replyToMode {
+	case "off", "all", "first":
+		return p.replyToMode
+	default:
+		return "first"
+	}
+}
+
 func (p *Platform) sendChannelReply(rc replyContext, content string) error {
+	return p.sendChannelMessages(rc, content)
+}
+
+func (p *Platform) sendChannel(rc replyContext, content string) error {
+	return p.sendChannelMessages(rc, content)
+}
+
+// sendChannelMessages is Hermes reply_to_mode: the first chunk of this
+// Send (and every chunk when mode=all) carries message_reference. Thread
+// isolation still replies to the user message — sending into the thread
+// does not drop the reference.
+func (p *Platform) sendChannelMessages(rc replyContext, content string) error {
+	p.recordKnownThreadParticipation(rc.targetChannelID(), rc.threadID)
 	chunks := core.SplitMessageCodeFenceAware(wrapTablesInCodeBlocks(content), maxDiscordLen)
-	for _, chunk := range chunks {
-		var err error
-		if rc.useThreadChannel() || rc.messageID == "" {
-			_, err = p.session.ChannelMessageSend(rc.targetChannelID(), chunk)
-		} else {
-			ref := &discordgo.MessageReference{MessageID: rc.messageID}
-			_, err = p.session.ChannelMessageSendReply(rc.channelID, chunk, ref)
-		}
-		if err != nil {
+	mode := p.effectiveReplyToMode()
+	for i, chunk := range chunks {
+		ref := rc.referenceForChunk(mode, i)
+		if err := p.sendChunk(rc.targetChannelID(), chunk, ref); err != nil {
 			return fmt.Errorf("discord: send: %w", err)
 		}
 	}
 	return nil
 }
 
-func (p *Platform) sendChannel(rc replyContext, content string) error {
-	chunks := core.SplitMessageCodeFenceAware(wrapTablesInCodeBlocks(content), maxDiscordLen)
-	for _, chunk := range chunks {
-		_, err := p.session.ChannelMessageSend(rc.targetChannelID(), chunk)
-		if err != nil {
-			return fmt.Errorf("discord: send: %w", err)
-		}
+func (p *Platform) sendChunk(channelID, content string, ref *discordgo.MessageReference) error {
+	if p.session == nil {
+		return fmt.Errorf("discord: session not connected")
 	}
-	return nil
+	msg := &discordgo.MessageSend{Content: content}
+	if ref != nil {
+		msg.Reference = ref
+	}
+	_, err := p.session.ChannelMessageSendComplex(channelID, msg)
+	if err != nil && ref != nil && isDiscordReplyReferenceRejected(err) {
+		slog.Warn("discord: reply target rejected the reply reference; retrying without it")
+		msg.Reference = nil
+		_, err = p.session.ChannelMessageSendComplex(channelID, msg)
+	}
+	return err
 }
 
 // SendImage sends an image to the channel or interaction.
@@ -1218,6 +1584,9 @@ func (p *progressPlatform) ProgressUpdateInterval() time.Duration {
 var _ core.ImageSender = (*Platform)(nil)
 var _ core.FileSender = (*Platform)(nil)
 var _ core.InlineButtonSender = (*Platform)(nil)
+var _ core.TypingIndicator = (*Platform)(nil)
+var _ core.TypingIndicatorDone = (*Platform)(nil)
+var _ core.TypingIndicatorFail = (*Platform)(nil)
 var _ core.ProgressStyleProvider = (*progressPlatform)(nil)
 var _ core.ProgressCardPayloadSupport = (*progressPlatform)(nil)
 var _ core.ProgressUpdateThrottler = (*progressPlatform)(nil)
@@ -1265,7 +1634,17 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 	}
 
 	msg := buildDiscordPreviewMessage(content)
+	if rc, ok := rctx.(replyContext); ok {
+		if ref := rc.referenceForChunk(p.effectiveReplyToMode(), 0); ref != nil {
+			msg.Reference = ref
+		}
+	}
 	sent, err := p.session.ChannelMessageSendComplex(channelID, msg)
+	if err != nil && msg.Reference != nil && isDiscordReplyReferenceRejected(err) {
+		slog.Warn("discord: preview reply target rejected the reply reference; retrying without it")
+		msg.Reference = nil
+		sent, err = p.session.ChannelMessageSendComplex(channelID, msg)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("discord: send preview: %w", err)
 	}
@@ -1295,22 +1674,51 @@ func (p *Platform) DeletePreviewMessage(ctx context.Context, previewHandle any) 
 	return p.session.ChannelMessageDelete(h.channelID, h.messageID)
 }
 
-// StartTyping sends a typing indicator and repeats every 8 seconds
-// (Discord typing status lasts ~10s) until the returned stop function is called.
+const (
+	discordAckEmoji  = "👀"
+	discordOkEmoji   = "✅"
+	discordFailEmoji = "❌"
+)
+
+func (p *Platform) addReaction(channelID, messageID, emoji string) {
+	if p == nil || p.session == nil || channelID == "" || messageID == "" || emoji == "" {
+		return
+	}
+	if err := p.session.MessageReactionAdd(channelID, messageID, emoji); err != nil {
+		slog.Debug("discord: add reaction failed", "emoji", emoji, "error", err)
+	}
+}
+
+func (p *Platform) removeOwnReaction(channelID, messageID, emoji string) {
+	if p == nil || p.session == nil || channelID == "" || messageID == "" || emoji == "" {
+		return
+	}
+	if err := p.session.MessageReactionRemove(channelID, messageID, emoji, "@me"); err != nil {
+		slog.Debug("discord: remove reaction failed", "emoji", emoji, "error", err)
+	}
+}
+
+// StartTyping shows Discord typing and, when reactions are on, 👀 on the
+// user's message (Hermes progress light). Stop clears 👀; ✅/❌ are added
+// afterwards by AddDoneReaction / AddFailReaction.
 func (p *Platform) StartTyping(ctx context.Context, rctx any) (stop func()) {
 	rc, ok := rctx.(replyContext)
 	if !ok {
 		return func() {}
 	}
-	channelID := rc.channelID
-	if rc.targetChannelID() != "" {
-		channelID = rc.targetChannelID()
-	}
+	channelID := rc.targetChannelID()
 	if channelID == "" {
 		return func() {}
 	}
+	reactCh := rc.reactionChannelID()
+	msgID := rc.messageID
+	if p.reactions && msgID != "" {
+		p.addReaction(reactCh, msgID, discordAckEmoji)
+	}
 
-	_ = p.session.ChannelTyping(channelID)
+	if p.session != nil {
+		_ = p.session.ChannelTyping(channelID)
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -1323,12 +1731,41 @@ func (p *Platform) StartTyping(ctx context.Context, rctx any) (stop func()) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_ = p.session.ChannelTyping(channelID)
+				if p.session != nil {
+					_ = p.session.ChannelTyping(channelID)
+				}
 			}
 		}
 	}()
 
-	return func() { close(done) }
+	return func() {
+		close(done)
+		if p.reactions && msgID != "" {
+			p.removeOwnReaction(reactCh, msgID, discordAckEmoji)
+		}
+	}
+}
+
+func (p *Platform) AddDoneReaction(rctx any) {
+	if !p.reactions {
+		return
+	}
+	rc, ok := rctx.(replyContext)
+	if !ok || rc.messageID == "" {
+		return
+	}
+	p.addReaction(rc.reactionChannelID(), rc.messageID, discordOkEmoji)
+}
+
+func (p *Platform) AddFailReaction(rctx any) {
+	if !p.reactions {
+		return
+	}
+	rc, ok := rctx.(replyContext)
+	if !ok || rc.messageID == "" {
+		return
+	}
+	p.addReaction(rc.reactionChannelID(), rc.messageID, discordFailEmoji)
 }
 
 func (p *Platform) ResolveChannelName(channelID string) (string, error) {
@@ -1364,6 +1801,75 @@ func (p *Platform) Stop() error {
 	if session != nil {
 		return session.Close()
 	}
+	return nil
+}
+
+// RenameSessionTitle implements core.SessionTitleRenamer. Hermes-style:
+// only rename a thread this bot just created, and only while Discord still
+// shows the placeholder name (a human rename is left alone).
+func (p *Platform) RenameSessionTitle(ctx context.Context, replyCtx any, title string) error {
+	rc, ok := replyCtx.(replyContext)
+	if !ok {
+		return nil
+	}
+	threadID := rc.threadID
+	if threadID == "" {
+		threadID = rc.channelID
+	}
+	placeholder := rc.autoThreadInitialName
+	if placeholder == "" {
+		placeholder = p.autoThreadPlaceholder(threadID)
+	}
+	return p.renameAutoThread(threadID, placeholder, title)
+}
+
+func shouldRenameAutoThread(currentName, onlyIfCurrentName, cleaned string) bool {
+	if onlyIfCurrentName == "" || cleaned == "" || cleaned == onlyIfCurrentName {
+		return false
+	}
+	if currentName != onlyIfCurrentName {
+		return false
+	}
+	return currentName != cleaned
+}
+
+func (p *Platform) renameAutoThread(threadID, onlyIfCurrentName, title string) error {
+	if onlyIfCurrentName == "" || threadID == "" {
+		return nil
+	}
+	cleaned := sanitizeDiscordThreadTitle(title)
+	if cleaned == "" || cleaned == onlyIfCurrentName {
+		return nil
+	}
+	p.mu.RLock()
+	session := p.session
+	p.mu.RUnlock()
+	if session == nil {
+		return nil
+	}
+	ch, err := session.Channel(threadID)
+	if err != nil || ch == nil {
+		slog.Debug("discord: resolve thread for rename failed", "thread", threadID, "error", err)
+		return nil
+	}
+	if !isThreadChannelType(ch.Type) {
+		return nil
+	}
+	if !shouldRenameAutoThread(ch.Name, onlyIfCurrentName, cleaned) {
+		if ch.Name != onlyIfCurrentName {
+			slog.Info("discord: skip semantic thread rename; current name is not the placeholder",
+				"thread", threadID, "current", ch.Name, "expected", onlyIfCurrentName)
+			p.forgetAutoThreadPlaceholder(threadID)
+		}
+		return nil
+	}
+	_, err = session.ChannelEdit(threadID, &discordgo.ChannelEdit{Name: cleaned})
+	if err != nil {
+		slog.Debug("discord: semantic thread rename failed", "thread", threadID, "error", err)
+		return nil
+	}
+	p.forgetAutoThreadPlaceholder(threadID)
+	slog.Info("discord: renamed auto-thread", "thread", threadID, "from", onlyIfCurrentName, "to", cleaned)
 	return nil
 }
 

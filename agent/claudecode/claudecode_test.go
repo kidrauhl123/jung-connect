@@ -544,7 +544,7 @@ func TestWorkspaceAgentOptions_FullSnapshot(t *testing.T) {
 	// PATH. WorkspaceAgentOptions only reads fields that the production
 	// New() also writes; this just verifies the snapshot shape.
 	a := &Agent{
-		cmd:           "my-cli",
+		cmd:              "my-cli",
 		cliExtraArgs:     []string{"--add-dir", "/parent"},
 		cmdArgsFlag:      "-a",
 		model:            "claude-opus-4-7",
@@ -560,7 +560,7 @@ func TestWorkspaceAgentOptions_FullSnapshot(t *testing.T) {
 
 	want := map[string]any{
 		"mode":               "acceptEdits",
-		"cmd":           "my-cli --add-dir /parent",
+		"cmd":                "my-cli --add-dir /parent",
 		"cmd_args_flag":      "-a",
 		"model":              "claude-opus-4-7",
 		"reasoning_effort":   "high",
@@ -622,7 +622,7 @@ func TestWorkspaceAgentOptions_RoundTripsThroughNew(t *testing.T) {
 		t.Skip("run_as_user-based LookPath bypass is Unix-only")
 	}
 	parent := &Agent{
-		cmd:           "my-cli",
+		cmd:              "my-cli",
 		cliExtraArgs:     []string{"code", "--add-dir", "/parent"},
 		cmdArgsFlag:      "-a",
 		model:            "claude-opus-4-7",
@@ -755,6 +755,34 @@ func TestScanSessionMeta_CustomTitleOverridesAITitle(t *testing.T) {
 	summary, _ := scanSessionMeta(path)
 	if summary != "User renamed title" {
 		t.Errorf("scanSessionMeta summary = %q, want custom-title", summary)
+	}
+}
+
+func TestGetLLMSessionTitle_UsesAITitleNotUserFallback(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	workDir := filepath.Join(home, "proj")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	projectDir := filepath.Join(home, ".claude", "projects", encodeClaudeProjectKey(workDir))
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(projectDir, "sess-llm.jsonl")
+	lines := []string{
+		`{"type": "user", "message": {"content": "please look at the login button"}}`,
+		`{"type": "ai-title", "sessionId": "sess-llm", "aiTitle": "Fix login button"}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{workDir: workDir}
+	if got := a.GetLLMSessionTitle("sess-llm"); got != "Fix login button" {
+		t.Fatalf("GetLLMSessionTitle = %q, want AI title", got)
+	}
+	if got := a.GetLLMSessionTitle("missing"); got != "" {
+		t.Fatalf("missing session = %q, want empty", got)
 	}
 }
 

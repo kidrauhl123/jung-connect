@@ -219,6 +219,9 @@ func TestResolveThreadReplyContext_CreatesThreadForGuildMessage(t *testing.T) {
 	if joinedThread != "thread-99" {
 		t.Fatalf("joinedThread = %q, want thread-99", joinedThread)
 	}
+	if rc.autoThreadInitialName != "investigate build failure" {
+		t.Fatalf("autoThreadInitialName = %q, want placeholder used at create", rc.autoThreadInitialName)
+	}
 }
 
 func TestSessionKeyForChannel_UsesThreadKeyWhenChannelIsThread(t *testing.T) {
@@ -1061,6 +1064,226 @@ func TestUpdateMessage_PlainTextClearsEmbeds(t *testing.T) {
 	}
 }
 
+func decodeDiscordPayload(t *testing.T, r *http.Request) map[string]any {
+	t.Helper()
+	var payload map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	return payload
+}
+
+func TestNew_DefaultsReactionsAndReplyToMode(t *testing.T) {
+	pAny, err := New(map[string]any{"token": "test-token", "progress_style": "legacy"})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	p := basePlatformFor(t, pAny)
+	if !p.reactions {
+		t.Fatal("reactions default should be true")
+	}
+	if p.replyToMode != "first" {
+		t.Fatalf("replyToMode = %q, want first", p.replyToMode)
+	}
+
+	pAny, err = New(map[string]any{
+		"token":          "test-token",
+		"reactions":      false,
+		"reply_to_mode":  "off",
+		"progress_style": "legacy",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	p = basePlatformFor(t, pAny)
+	if p.reactions {
+		t.Fatal("reactions = false should be stored")
+	}
+	if p.replyToMode != "off" {
+		t.Fatalf("replyToMode = %q, want off", p.replyToMode)
+	}
+
+	if _, err := New(map[string]any{"token": "test-token", "reply_to_mode": "nope"}); err == nil {
+		t.Fatal("invalid reply_to_mode should error")
+	}
+}
+
+func TestSend_ReplyToModeFirst_FirstChunkReferences(t *testing.T) {
+	var posts []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts = append(posts, decodeDiscordPayload(t, r))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"out-%d","channel_id":"ch-1"}`, len(posts))
+	}))
+	defer server.Close()
+
+	p := &Platform{session: newTestDiscordSession(t, server), replyToMode: "first"}
+	long := strings.Repeat("a", maxDiscordLen+20)
+	rc := newReplyContext("ch-1", "user-msg", "", "ch-1")
+	if err := p.Send(context.Background(), rc, long); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if len(posts) < 2 {
+		t.Fatalf("posts = %d, want at least 2 chunks", len(posts))
+	}
+	ref, _ := posts[0]["message_reference"].(map[string]any)
+	if ref == nil || ref["message_id"] != "user-msg" {
+		t.Fatalf("first chunk reference = %#v, want user-msg", posts[0]["message_reference"])
+	}
+	if _, ok := posts[1]["message_reference"]; ok {
+		t.Fatalf("later chunk should not carry message_reference: %#v", posts[1])
+	}
+}
+
+func TestSend_ReplyToModeFirst_ThreadIsolationStillReferences(t *testing.T) {
+	var (
+		channelPath string
+		payload     map[string]any
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		channelPath = r.URL.Path
+		payload = decodeDiscordPayload(t, r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"out-1","channel_id":"thread-1"}`)
+	}))
+	defer server.Close()
+
+	p := &Platform{session: newTestDiscordSession(t, server), replyToMode: "first", threadIsolation: true}
+	rc := newReplyContext("thread-1", "user-msg", "thread-1", "parent-1")
+	if err := p.Send(context.Background(), rc, "hello in thread"); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if !strings.Contains(channelPath, "/channels/thread-1/messages") {
+		t.Fatalf("path = %q, want send into thread-1", channelPath)
+	}
+	ref, _ := payload["message_reference"].(map[string]any)
+	if ref == nil || ref["message_id"] != "user-msg" {
+		t.Fatalf("thread send reference = %#v, want user-msg", payload["message_reference"])
+	}
+	if ref["channel_id"] != "parent-1" {
+		t.Fatalf("reference channel_id = %#v, want parent-1 (source of user message)", ref["channel_id"])
+	}
+}
+
+func TestSend_ReplyToModeOff_OmitsReference(t *testing.T) {
+	var payload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload = decodeDiscordPayload(t, r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"out-1","channel_id":"ch-1"}`)
+	}))
+	defer server.Close()
+
+	p := &Platform{session: newTestDiscordSession(t, server), replyToMode: "off"}
+	rc := newReplyContext("ch-1", "user-msg", "", "ch-1")
+	if err := p.Send(context.Background(), rc, "plain"); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if _, ok := payload["message_reference"]; ok {
+		t.Fatalf("message_reference = %#v, want omitted in off mode", payload["message_reference"])
+	}
+}
+
+func TestSend_UnknownMessageReferenceRetriesWithoutReply(t *testing.T) {
+	var posts []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload := decodeDiscordPayload(t, r)
+		posts = append(posts, payload)
+		if _, ok := payload["message_reference"]; ok && len(posts) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprint(w, `{"message":"Unknown Message","code":10008}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"out-1","channel_id":"ch-1"}`)
+	}))
+	defer server.Close()
+
+	p := &Platform{session: newTestDiscordSession(t, server), replyToMode: "first"}
+	rc := newReplyContext("ch-1", "missing-msg", "", "ch-1")
+	if err := p.Send(context.Background(), rc, "hello"); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if len(posts) != 2 {
+		t.Fatalf("posts = %d, want 2 (reference then retry)", len(posts))
+	}
+	if _, ok := posts[1]["message_reference"]; ok {
+		t.Fatalf("retry still had message_reference: %#v", posts[1])
+	}
+}
+
+func TestStartTyping_ProgressLightThenDone(t *testing.T) {
+	var methods []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/reactions/") {
+			methods = append(methods, r.Method+" "+r.URL.Path)
+		}
+		if r.Method == http.MethodPut || r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{}`)
+	}))
+	defer server.Close()
+
+	p := &Platform{session: newTestDiscordSession(t, server), reactions: true}
+	rc := newReplyContext("ch-1", "user-msg", "", "ch-1")
+	stop := p.StartTyping(context.Background(), rc)
+	stop()
+	p.AddDoneReaction(rc)
+
+	joined := strings.Join(methods, "\n")
+	if !strings.Contains(joined, "PUT") || !strings.Contains(joined, "DELETE") {
+		t.Fatalf("reaction calls = %v, want PUT 👀 then DELETE 👀 then PUT ✅", methods)
+	}
+	if len(methods) != 3 {
+		t.Fatalf("reaction calls = %v, want 3 (add 👀, remove 👀, add ✅)", methods)
+	}
+	if methods[0][:3] != "PUT" || methods[1][:6] != "DELETE" || methods[2][:3] != "PUT" {
+		t.Fatalf("reaction order = %v", methods)
+	}
+}
+
+func TestStartTyping_ReactionsDisabled(t *testing.T) {
+	var reactionCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/reactions/") {
+			reactionCalls++
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{}`)
+	}))
+	defer server.Close()
+
+	p := &Platform{session: newTestDiscordSession(t, server), reactions: false}
+	rc := newReplyContext("ch-1", "user-msg", "", "ch-1")
+	stop := p.StartTyping(context.Background(), rc)
+	stop()
+	p.AddDoneReaction(rc)
+	p.AddFailReaction(rc)
+	if reactionCalls != 0 {
+		t.Fatalf("reactionCalls = %d, want 0 when reactions disabled", reactionCalls)
+	}
+}
+
+func TestAddFailReaction_OnUserMessage(t *testing.T) {
+	var path string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	p := &Platform{session: newTestDiscordSession(t, server), reactions: true}
+	rc := newReplyContext("thread-1", "user-msg", "thread-1", "parent-1")
+	p.AddFailReaction(rc)
+	if !strings.Contains(path, "/channels/parent-1/messages/user-msg/reactions/") {
+		t.Fatalf("fail reaction path = %q, want parent channel + user message", path)
+	}
+}
+
 func TestSendChannelReply_WithoutMessageIDFallsBackToChannelSend(t *testing.T) {
 	var payload map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1393,6 +1616,7 @@ func TestReplyContextForDeferredInteractionFallback(t *testing.T) {
 		{"guild text", &discordgo.Channel{ID: cid, Type: discordgo.ChannelTypeGuildText}, replyContext{channelID: cid}},
 		{"public thread", &discordgo.Channel{ID: cid, Type: discordgo.ChannelTypeGuildPublicThread}, replyContext{channelID: cid, threadID: cid}},
 		{"private thread", &discordgo.Channel{ID: cid, Type: discordgo.ChannelTypeGuildPrivateThread}, replyContext{channelID: cid, threadID: cid}},
+		{"news thread", &discordgo.Channel{ID: cid, Type: discordgo.ChannelTypeGuildNewsThread}, replyContext{channelID: cid, threadID: cid}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1505,6 +1729,187 @@ func TestIsGroupReplyAllGuild_UnknownGuildReturnsFalse(t *testing.T) {
 	p := &Platform{groupReplyAllGuilds: []string{"G-A", "G-B"}}
 	if p.isGroupReplyAllGuild("G-OTHER") {
 		t.Fatal("unlisted guild G-OTHER should not match")
+	}
+}
+
+// ── in-thread mention shortcut (Hermes-style) ─────────────────
+
+func threadOpsFor(id string, typ discordgo.ChannelType) fakeThreadOps {
+	return fakeThreadOps{
+		resolveChannel: func(channelID string) (*discordgo.Channel, error) {
+			if channelID != id {
+				return nil, fmt.Errorf("unknown channel %s", channelID)
+			}
+			return &discordgo.Channel{ID: channelID, Type: typ, ParentID: "parent-1"}, nil
+		},
+	}
+}
+
+func TestGuildMessageSkipsMention_ParticipatedThread(t *testing.T) {
+	p := &Platform{}
+	p.markParticipatedThread("thread-1")
+	ops := threadOpsFor("thread-1", discordgo.ChannelTypeGuildPublicThread)
+	if !p.guildMessageSkipsMention("guild-1", "thread-1", ops) {
+		t.Fatal("a thread the bot already joined should skip @mention")
+	}
+}
+
+func TestGuildMessageSkipsMention_UnparticipatedThreadStillRequiresMention(t *testing.T) {
+	p := &Platform{}
+	ops := threadOpsFor("thread-1", discordgo.ChannelTypeGuildPublicThread)
+	if p.guildMessageSkipsMention("guild-1", "thread-1", ops) {
+		t.Fatal("a thread the bot has not joined must still require @mention")
+	}
+}
+
+func TestGuildMessageSkipsMention_ParentChannelStillRequiresMention(t *testing.T) {
+	p := &Platform{}
+	p.markParticipatedThread("thread-1")
+	ops := threadOpsFor("channel-1", discordgo.ChannelTypeGuildText)
+	if p.guildMessageSkipsMention("guild-1", "channel-1", ops) {
+		t.Fatal("parent text channels must still require @mention")
+	}
+}
+
+func TestGuildMessageSkipsMention_ThreadRequireMentionDisablesShortcut(t *testing.T) {
+	p := &Platform{threadRequireMention: true}
+	p.markParticipatedThread("thread-1")
+	ops := threadOpsFor("thread-1", discordgo.ChannelTypeGuildPublicThread)
+	if p.guildMessageSkipsMention("guild-1", "thread-1", ops) {
+		t.Fatal("thread_require_mention must keep threads mention-gated")
+	}
+}
+
+func TestGuildMessageSkipsMention_GroupReplyAllStillWins(t *testing.T) {
+	p := &Platform{groupReplyAllGuilds: []string{"*"}, threadRequireMention: true}
+	ops := threadOpsFor("channel-1", discordgo.ChannelTypeGuildText)
+	if !p.guildMessageSkipsMention("guild-1", "channel-1", ops) {
+		t.Fatal("group_reply_all should still skip mention even with thread_require_mention")
+	}
+}
+
+func TestRecordThreadParticipation_MarksReplyThread(t *testing.T) {
+	p := &Platform{}
+	p.recordThreadParticipation("channel-1", "thread-99", threadOpsFor("channel-1", discordgo.ChannelTypeGuildText))
+	if !p.hasParticipatedInThread("thread-99") {
+		t.Fatal("recordThreadParticipation should mark reply-context thread ID")
+	}
+}
+
+func TestRecordThreadParticipation_MarksThreadChannel(t *testing.T) {
+	p := &Platform{}
+	p.recordThreadParticipation("thread-1", "", threadOpsFor("thread-1", discordgo.ChannelTypeGuildPublicThread))
+	if !p.hasParticipatedInThread("thread-1") {
+		t.Fatal("a message already in a thread channel should mark that thread")
+	}
+}
+
+func TestRecordThreadParticipation_IgnoresParentTextChannel(t *testing.T) {
+	p := &Platform{}
+	p.recordThreadParticipation("channel-1", "", threadOpsFor("channel-1", discordgo.ChannelTypeGuildText))
+	if p.hasParticipatedInThread("channel-1") {
+		t.Fatal("parent text channels must not be stored as participated threads")
+	}
+}
+
+func TestParticipatedThreads_PersistsAcrossNew(t *testing.T) {
+	dir := t.TempDir()
+	opts := map[string]any{
+		"token":       "test-token",
+		"cc_data_dir": dir,
+		"cc_project":  "claude",
+	}
+	firstAny, err := New(opts)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	first := basePlatformFor(t, firstAny)
+	first.markParticipatedThread("thread-persist")
+
+	secondAny, err := New(opts)
+	if err != nil {
+		t.Fatalf("New() reload error = %v", err)
+	}
+	second := basePlatformFor(t, secondAny)
+	if !second.hasParticipatedInThread("thread-persist") {
+		t.Fatal("participated thread set must reload from data_dir after restart")
+	}
+}
+
+func TestNew_ParsesThreadRequireMention(t *testing.T) {
+	pAny, err := New(map[string]any{
+		"token":                  "test-token",
+		"thread_require_mention": true,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if !basePlatformFor(t, pAny).threadRequireMention {
+		t.Fatal("thread_require_mention = true should be stored on the platform")
+	}
+}
+
+func TestSanitizeDiscordThreadTitle_UTF16AndMentions(t *testing.T) {
+	if got := sanitizeDiscordThreadTitle("  hello\nworld  "); got != "hello world" {
+		t.Fatalf("collapse = %q", got)
+	}
+	if got := sanitizeDiscordThreadTitle(""); got != "cc session" {
+		t.Fatalf("empty = %q", got)
+	}
+	long := strings.Repeat("a", 200)
+	got := sanitizeDiscordThreadTitle(long)
+	if utf16Len(got) > 80 {
+		t.Fatalf("utf16 length %d > 80 for %q", utf16Len(got), got)
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Fatalf("long title should end with ..., got %q", got)
+	}
+
+	msg := &discordgo.MessageCreate{Message: &discordgo.Message{
+		Content: "<@bot-1> <@&999> <#123> look at this",
+		Author:  &discordgo.User{Username: "jun"},
+	}}
+	if name := threadNameForMessage(msg, "bot-1"); name != "look at this" {
+		t.Fatalf("threadNameForMessage = %q, want mention-stripped content", name)
+	}
+}
+
+func TestRenameSessionTitle_NoPlaceholderIsNoop(t *testing.T) {
+	p := &Platform{}
+	if err := p.RenameSessionTitle(context.Background(), replyContext{threadID: "t1"}, "New title"); err != nil {
+		t.Fatalf("RenameSessionTitle error = %v", err)
+	}
+}
+
+func TestShouldRenameAutoThread(t *testing.T) {
+	if shouldRenameAutoThread("placeholder", "", "New") {
+		t.Fatal("missing placeholder must not rename")
+	}
+	if shouldRenameAutoThread("human name", "placeholder", "New") {
+		t.Fatal("human-renamed thread must not be clobbered")
+	}
+	if shouldRenameAutoThread("placeholder", "placeholder", "placeholder") {
+		t.Fatal("same name must not rename")
+	}
+	if !shouldRenameAutoThread("placeholder", "placeholder", "Fix login") {
+		t.Fatal("placeholder still in place should rename")
+	}
+}
+
+func TestAttachAutoThreadPlaceholder_FollowUpUsesStoredName(t *testing.T) {
+	p := &Platform{}
+	created := p.attachAutoThreadPlaceholder(replyContext{threadID: "t1", autoThreadInitialName: "look at this"})
+	if created.autoThreadInitialName != "look at this" {
+		t.Fatalf("created = %q", created.autoThreadInitialName)
+	}
+	follow := p.attachAutoThreadPlaceholder(replyContext{threadID: "t1"})
+	if follow.autoThreadInitialName != "look at this" {
+		t.Fatalf("follow-up lost placeholder: %q", follow.autoThreadInitialName)
+	}
+	p.forgetAutoThreadPlaceholder("t1")
+	gone := p.attachAutoThreadPlaceholder(replyContext{threadID: "t1"})
+	if gone.autoThreadInitialName != "" {
+		t.Fatalf("forgotten placeholder still attached: %q", gone.autoThreadInitialName)
 	}
 }
 
@@ -1776,4 +2181,3 @@ func basePlatformFor(t *testing.T, pAny core.Platform) *Platform {
 		return nil
 	}
 }
-

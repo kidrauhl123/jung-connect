@@ -247,6 +247,22 @@ func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error)
 	return listAntigravitySessions(a.workDir)
 }
 
+func (a *Agent) GetLLMSessionTitle(sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || strings.Contains(sessionID, "/") || strings.Contains(sessionID, "\\") || sessionID == "." || sessionID == ".." {
+		return ""
+	}
+	dataDir, err := antigravityDataDir()
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(dataDir, "annotations", sessionID+".pbtxt"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(parsePbtxtTitle(data))
+}
+
 func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" || strings.Contains(sessionID, "/") || strings.Contains(sessionID, "\\") || sessionID == "." || sessionID == ".." {
@@ -291,7 +307,6 @@ func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 	}
 	return nil
 }
-
 
 func (a *Agent) Stop() error { return nil }
 
