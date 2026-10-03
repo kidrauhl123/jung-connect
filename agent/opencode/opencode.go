@@ -32,6 +32,7 @@ type Agent struct {
 	workDir              string
 	model                string
 	mode                 string
+	reasoningEffort      string
 	cmd                  string   // CLI binary name, default "opencode"
 	cliExtraArgs         []string // extra args from cmd after the binary name
 	configEnv            []string // env vars from [projects.agent.options.env]
@@ -69,6 +70,8 @@ func New(opts map[string]any) (core.Agent, error) {
 	model, _ := opts["model"].(string)
 	mode, _ := opts["mode"].(string)
 	mode = normalizeMode(mode)
+	reasoningEffort, _ := opts["reasoning_effort"].(string)
+	reasoningEffort = normalizeReasoningEffort(reasoningEffort)
 	cmd, extraArgs := core.ParseCmdOpts(opts, "opencode")
 	agentName, _ := opts["agent"].(string) // --agent flag for plugin-defined agents (#1210)
 	ccDataDir, _ := opts["cc_data_dir"].(string)
@@ -87,6 +90,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		workDir:              workDir,
 		model:                model,
 		mode:                 mode,
+		reasoningEffort:      reasoningEffort,
 		cmd:                  cmd,
 		cliExtraArgs:         extraArgs,
 		configEnv:            core.ParseConfigEnv(opts),
@@ -194,6 +198,15 @@ func normalizeMode(raw string) string {
 	}
 }
 
+func normalizeReasoningEffort(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "minimal", "low", "medium", "high", "xhigh":
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return ""
+	}
+}
+
 func (a *Agent) Name() string { return "opencode" }
 
 func (a *Agent) SetWorkDir(dir string) {
@@ -214,6 +227,23 @@ func (a *Agent) SetModel(model string) {
 	defer a.mu.Unlock()
 	a.model = model
 	slog.Info("opencode: model changed", "model", model)
+}
+
+func (a *Agent) SetReasoningEffort(effort string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reasoningEffort = normalizeReasoningEffort(effort)
+	slog.Info("opencode: reasoning effort changed", "reasoning_effort", a.reasoningEffort)
+}
+
+func (a *Agent) GetReasoningEffort() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.reasoningEffort
+}
+
+func (a *Agent) AvailableReasoningEfforts() []string {
+	return []string{"minimal", "low", "medium", "high", "xhigh"}
 }
 
 func (a *Agent) GetModel() string {
@@ -433,6 +463,13 @@ func (a *Agent) discoverModelsWithSnapshot(ctx context.Context, snapshot opencod
 
 func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
 	snapshot := a.modelDiscoverySnapshot()
+	configured := a.configuredModelsForSnapshot(snapshot)
+
+	// Prefer live New API /v1/models (prefix newapi/) so the bridge menu tracks the gateway.
+	if models := a.fetchModelsFromNewAPI(ctx); len(models) > 0 {
+		return core.MergeModelAliases(models, configured)
+	}
+
 	if models := a.persistentModelsForSnapshot(snapshot); len(models) > 0 {
 		a.startPersistentModelRefresh(snapshot, false)
 		return models
@@ -443,8 +480,8 @@ func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
 		}
 		return models
 	}
-	if models := a.configuredModelsForSnapshot(snapshot); len(models) > 0 {
-		return models
+	if len(configured) > 0 {
+		return configured
 	}
 	return []core.ModelOption{
 		{Name: "anthropic/claude-sonnet-4-20250514", Desc: "Claude Sonnet 4 (default)"},
@@ -452,6 +489,34 @@ func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
 		{Name: "openai/gpt-4o", Desc: "GPT-4o"},
 		{Name: "openai/o3", Desc: "OpenAI o3"},
 	}
+}
+
+func (a *Agent) fetchModelsFromNewAPI(ctx context.Context) []core.ModelOption {
+	a.mu.RLock()
+	apiKey := ""
+	baseURL := ""
+	if a.activeIdx >= 0 && a.activeIdx < len(a.providers) {
+		apiKey = a.providers[a.activeIdx].APIKey
+		baseURL = a.providers[a.activeIdx].BaseURL
+	}
+	a.mu.RUnlock()
+	baseURL, apiKey = core.ResolveModelsAPICreds(baseURL, apiKey)
+	if apiKey == "" || baseURL == "" {
+		return nil
+	}
+	raw := core.FetchOpenAICompatibleModels(ctx, baseURL, apiKey)
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]core.ModelOption, 0, len(raw))
+	for _, m := range raw {
+		name := m.Name
+		if !strings.Contains(name, "/") {
+			name = "newapi/" + name
+		}
+		out = append(out, core.ModelOption{Name: name, Desc: m.Desc, Alias: m.Alias, Group: m.Group})
+	}
+	return out
 }
 
 func (a *Agent) SetSessionEnv(env []string) {
@@ -464,6 +529,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	a.mu.Lock()
 	model := a.model
 	mode := a.mode
+	reasoningEffort := a.reasoningEffort
 	cmd := a.cmd
 	extraArgs := append([]string{}, a.cliExtraArgs...)
 	workDir := a.workDir
@@ -478,7 +544,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 	a.mu.Unlock()
 
-	return newOpencodeSession(ctx, cmd, extraArgs, workDir, model, mode, agentName, sessionID, extraEnv)
+	return newOpencodeSession(ctx, cmd, extraArgs, workDir, model, mode, reasoningEffort, agentName, sessionID, extraEnv)
 }
 
 // ListSessions runs `opencode session list` and parses the JSON output.

@@ -803,3 +803,147 @@ func TestLookupEffectiveBinding_NoIsolationUnbindsMissing(t *testing.T) {
 		t.Errorf("expected missing workspace binding to be unbound without isolation, got %+v", got)
 	}
 }
+
+
+// TestCommandContextWithWorkspace_UnboundUsesFallback verifies that when
+// fallback_work_dir is configured, an unbound channel silently routes to that
+// directory via a workspace agent (no init flow, no empty mkdir prompt).
+func TestCommandContextWithWorkspace_UnboundUsesFallback(t *testing.T) {
+	baseDir := t.TempDir()
+	fallback := t.TempDir()
+	e := newTestEngineWithMultiWorkspaceAgent(t, baseDir)
+	e.SetFallbackWorkDir(fallback)
+
+	p := &mockChannelResolver{name: "test-platform", names: map[string]string{}}
+	msg := &Message{
+		Platform:   "test-platform",
+		ChannelKey: "C-unbound-fb",
+		SessionKey: "test-platform:C-unbound-fb:U-001",
+	}
+
+	agent, sessions, interactiveKey, workspaceDir, err := e.commandContextWithWorkspace(p, msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	wantWS := normalizeWorkspacePath(fallback)
+	if workspaceDir != wantWS {
+		t.Errorf("workspaceDir = %q, want fallback %q", workspaceDir, wantWS)
+	}
+	if agent == e.agent {
+		t.Errorf("expected workspace-scoped agent for fallback, got global e.agent")
+	}
+	if sessions == e.sessions {
+		t.Errorf("expected workspace-scoped sessions for fallback, got global e.sessions")
+	}
+	wantKey := wantWS + ":" + msg.SessionKey
+	if interactiveKey != wantKey {
+		t.Errorf("interactiveKey = %q, want %q", interactiveKey, wantKey)
+	}
+}
+
+// TestResolveWorkspace_UnboundStillEmptyWithFallback ensures resolveWorkspace
+// itself stays binding/convention-only; fallback is applied by callers.
+func TestResolveWorkspace_UnboundStillEmptyWithFallback(t *testing.T) {
+	baseDir := t.TempDir()
+	fallback := t.TempDir()
+	e := newTestEngineWithMultiWorkspace(t, baseDir)
+	e.SetFallbackWorkDir(fallback)
+
+	p := &mockChannelResolver{names: map[string]string{"C099": "no-dir-here"}}
+	ws, name, err := e.resolveWorkspace(p, "C099")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ws != "" {
+		t.Errorf("resolveWorkspace should return empty when unbound (fallback is caller-side), got %q", ws)
+	}
+	if name != "no-dir-here" {
+		t.Errorf("channel name = %q, want %q", name, "no-dir-here")
+	}
+	if got := e.effectiveFallbackWorkspace(); got != normalizeWorkspacePath(fallback) {
+		t.Errorf("effectiveFallbackWorkspace = %q, want %q", got, normalizeWorkspacePath(fallback))
+	}
+}
+
+// TestWorkspaceInitFlow_SkipGitEmptyChannelNameDoesNotPromptMkdir guards against
+// the "I'll mkdir ``" prompt when a Telegram topic (or similar) has no name.
+func TestWorkspaceInitFlow_SkipGitEmptyChannelNameDoesNotPromptMkdir(t *testing.T) {
+	baseDir := t.TempDir()
+	e := newTestEngineWithMultiWorkspace(t, baseDir)
+	e.SetSkipGit(true)
+
+	p := &mockChannelResolver{names: map[string]string{}}
+	msg := &Message{
+		SessionKey: "mock:C-empty:user1",
+		ChannelKey: "C-empty",
+		Content:    "hello without binding",
+	}
+	consumed := e.handleWorkspaceInitFlow(p, msg, "")
+	if consumed {
+		t.Fatal("expected handleWorkspaceInitFlow to return false for empty channelName under skip_git")
+	}
+	e.initFlowsMu.Lock()
+	_, exists := e.initFlows[effectiveWorkspaceChannelKey(msg)]
+	e.initFlowsMu.Unlock()
+	if exists {
+		t.Fatal("expected no init flow to be created for empty channelName")
+	}
+}
+
+// TestCommandContextWithWorkspace_BoundOverridesFallback ensures an explicit
+// binding still wins over fallback_work_dir.
+func TestCommandContextWithWorkspace_BoundOverridesFallback(t *testing.T) {
+	baseDir := t.TempDir()
+	fallback := t.TempDir()
+	bound := filepath.Join(baseDir, "bound-project")
+	if err := os.MkdirAll(bound, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e := newTestEngineWithMultiWorkspaceAgent(t, baseDir)
+	e.SetFallbackWorkDir(fallback)
+
+	channelID := "C-bound"
+	p := &mockChannelResolver{name: "test-platform", names: map[string]string{channelID: "bound-project"}}
+	// Convention match auto-binds bound-project
+	ws, _, err := e.resolveWorkspace(p, channelID)
+	if err != nil || ws == "" {
+		t.Fatalf("expected convention bind, ws=%q err=%v", ws, err)
+	}
+
+	msg := &Message{
+		Platform:   "test-platform",
+		ChannelKey: channelID,
+		SessionKey: "test-platform:" + channelID + ":U-001",
+	}
+	_, _, _, workspaceDir, err := e.commandContextWithWorkspace(p, msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := normalizeWorkspacePath(bound)
+	if workspaceDir != want {
+		t.Errorf("workspaceDir = %q, want bound %q (not fallback)", workspaceDir, want)
+	}
+}
+
+
+// TestSessionContextForKey_UnboundUsesFallback ensures card/async /model paths
+// resolve unbound channels to the fallback workspace agent, not e.agent.
+func TestSessionContextForKey_UnboundUsesFallback(t *testing.T) {
+	baseDir := t.TempDir()
+	fallback := t.TempDir()
+	e := newTestEngineWithMultiWorkspaceAgent(t, baseDir)
+	e.SetFallbackWorkDir(fallback)
+
+	sessionKey := "test-platform:C-unbound-fb:U-001"
+	agent, sessions := e.sessionContextForKey(sessionKey)
+	if agent == e.agent {
+		t.Fatal("sessionContextForKey returned global e.agent for unbound+fallback")
+	}
+	if sessions == e.sessions {
+		t.Fatal("sessionContextForKey returned global sessions for unbound+fallback")
+	}
+	wantWS := normalizeWorkspacePath(fallback)
+	if got := e.interactiveKeyForSessionKey(sessionKey); got != wantWS+":"+sessionKey {
+		t.Fatalf("interactiveKeyForSessionKey = %q, want %q", got, wantWS+":"+sessionKey)
+	}
+}

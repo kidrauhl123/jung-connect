@@ -29,6 +29,7 @@ type opencodeSession struct {
 	workDir           string
 	model             string
 	mode              string
+	variant           string
 	agentName         string
 	extraEnv          []string
 	events            chan core.Event
@@ -41,7 +42,7 @@ type opencodeSession struct {
 	resultSent        atomic.Bool // true when EventResult has been sent for this turn
 }
 
-func newOpencodeSession(ctx context.Context, cmd string, extraArgs []string, workDir, model, mode, agentName, resumeID string, extraEnv []string) (*opencodeSession, error) {
+func newOpencodeSession(ctx context.Context, cmd string, extraArgs []string, workDir, model, mode, variant, agentName, resumeID string, extraEnv []string) (*opencodeSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	s := &opencodeSession{
@@ -50,6 +51,7 @@ func newOpencodeSession(ctx context.Context, cmd string, extraArgs []string, wor
 		workDir:   workDir,
 		model:     model,
 		mode:      mode,
+		variant:   variant,
 		agentName: agentName,
 		extraEnv:  extraEnv,
 		events:    make(chan core.Event, 64),
@@ -167,6 +169,9 @@ func (s *opencodeSession) buildRunArgs(prompt string, imagePaths []string, chatI
 	}
 	if s.model != "" {
 		args = append(args, "--model", s.model)
+	}
+	if s.variant != "" {
+		args = append(args, "--variant", s.variant)
 	}
 	if s.workDir != "" {
 		args = append(args, "--dir", s.workDir)

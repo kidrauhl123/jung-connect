@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -26,6 +27,43 @@ var telegramConvertAudioToOpus = core.ConvertAudioToOpus
 
 func init() {
 	core.RegisterPlatform("telegram", New)
+	core.RegisterPlatform("imgram", NewImgram)
+}
+
+const (
+	telegramAPIBase = "https://api.telegram.org"
+	imgramAPIBase   = "https://bot.premsir.com"
+)
+
+// emptyMultipartFixTransport rewrites empty multipart POSTs (Content-Type set,
+// zero body) to application/x-www-form-urlencoded so imGram accepts getMe and
+// other nil-param Bot API calls from github.com/go-telegram/bot.
+type emptyMultipartFixTransport struct {
+	base http.RoundTripper
+}
+
+func (t *emptyMultipartFixTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	ct := req.Header.Get("Content-Type")
+	if req.Method == http.MethodPost && strings.HasPrefix(ct, "multipart/") && req.Body != nil && req.Body != http.NoBody {
+		var first [1]byte
+		n, _ := req.Body.Read(first[:])
+		if n == 0 {
+			_ = req.Body.Close()
+			req = req.Clone(req.Context())
+			req.Body = http.NoBody
+			req.ContentLength = 0
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Del("Transfer-Encoding")
+		} else {
+			req = req.Clone(req.Context())
+			req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(first[:n]), req.Body))
+		}
+	}
+	return base.RoundTrip(req)
 }
 
 type replyContext struct {
@@ -50,6 +88,8 @@ type telegramBot interface {
 	GetFile(ctx context.Context, params *tgbot.GetFileParams) (*models.File, error)
 	FileDownloadLink(f *models.File) string
 	SetMessageReaction(ctx context.Context, params *tgbot.SetMessageReactionParams) (bool, error)
+	SendRichMessage(ctx context.Context, params *tgbot.SendRichMessageParams) (*models.Message, error)
+	GetChat(ctx context.Context, params *tgbot.GetChatParams) (*models.ChatFullInfo, error)
 }
 
 type backoffTimer interface {
@@ -105,11 +145,14 @@ func (t *stdlibTypingTicker) C() <-chan time.Time { return t.Ticker.C }
 type botFactory func(token string, onUpdate func(context.Context, *models.Update), httpClient *http.Client) (telegramBot, *models.User, func(context.Context), error)
 
 type Platform struct {
+	platformName         string
+	apiBase              string
 	token                 string
 	allowFrom             string
 	groupReplyAll         bool
 	shareSessionInChannel bool
 	enableReactions       bool
+	reactionEmojis        []string
 	progressStyle         string // "legacy" | "compact" — telegram has no rich card, so "card" is mapped to "compact"
 	httpClient            *http.Client
 
@@ -126,6 +169,11 @@ type Platform struct {
 	newBot              botFactory
 	newBackoffTimer     func(time.Duration) backoffTimer
 	newTypingTicker     func(time.Duration) typingTicker
+
+	// channelNameCache maps ChannelKey (chatID or chatID:threadID) → sanitized name.
+	// Populated from forum_topic_created/edited (and reply_to_message) plus GetChat.
+	channelNameCache   map[string]channelNameCacheEntry
+	channelNameCacheMu sync.RWMutex
 }
 
 const (
@@ -135,12 +183,34 @@ const (
 )
 
 func New(opts map[string]any) (core.Platform, error) {
+	return newPlatform(opts, "telegram", telegramAPIBase)
+}
+
+// NewImgram registers the established Telegram transport under an isolated
+// imGram identity. Its only wire-level change is the Bot API root.
+func NewImgram(opts map[string]any) (core.Platform, error) {
+	return newPlatform(opts, "imgram", imgramAPIBase)
+}
+
+func newPlatform(opts map[string]any, platformName, defaultAPIBase string) (core.Platform, error) {
 	token, _ := opts["token"].(string)
 	if token == "" {
-		return nil, fmt.Errorf("telegram: token is required")
+		return nil, fmt.Errorf("%s: token is required", platformName)
 	}
 	allowFrom, _ := opts["allow_from"].(string)
-	core.CheckAllowFrom("telegram", allowFrom)
+	core.CheckAllowFrom(platformName, allowFrom)
+	apiBase, _ := opts["api_base"].(string)
+	apiBase = strings.TrimRight(strings.TrimSpace(apiBase), "/")
+	if apiBase == "" {
+		apiBase = defaultAPIBase
+	}
+	parsedAPIBase, err := url.Parse(apiBase)
+	if err != nil || parsedAPIBase.Scheme != "https" || parsedAPIBase.Host == "" {
+		return nil, fmt.Errorf("%s: api_base must be an https URL", platformName)
+	}
+	if platformName == "imgram" && strings.EqualFold(parsedAPIBase.Host, "api.telegram.org") {
+		return nil, fmt.Errorf("imgram: api_base must not point at api.telegram.org")
+	}
 
 	// Build HTTP client with optional proxy support.
 	// Timeout must exceed the server-side long-poll duration (pollTimeout − 1s = 59s)
@@ -159,10 +229,21 @@ func New(opts map[string]any) (core.Platform, error) {
 		httpClient.Transport = &http.Transport{Proxy: http.ProxyURL(u)}
 		slog.Info("telegram: using proxy", "proxy", u.Host, "auth", proxyUser != "")
 	}
+	// go-telegram/bot sets multipart Content-Type even for nil-param methods
+	// (getMe) and then closes an empty body without a multipart terminator.
+	// Telegram tolerates that; imGram rejects it with "invalid multipart body".
+	if platformName == "imgram" {
+		base := httpClient.Transport
+		if base == nil {
+			base = http.DefaultTransport
+		}
+		httpClient.Transport = &emptyMultipartFixTransport{base: base}
+	}
 
 	groupReplyAll, _ := opts["group_reply_all"].(bool)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	enableReactions, _ := opts["enable_reactions"].(bool)
+	reactionEmojis := parseReactionEmojis(opts)
 
 	// Default to "compact" so streaming edits work out of the box. Telegram has
 	// no rich card UI, so "card" is normalized to "compact". Users can opt out
@@ -183,17 +264,31 @@ func New(opts map[string]any) (core.Platform, error) {
 	}
 
 	return &Platform{
+		platformName:         platformName,
+		apiBase:              apiBase,
+		newBot: func(token string, onUpdate func(context.Context, *models.Update), httpClient *http.Client) (telegramBot, *models.User, func(context.Context), error) {
+			return newBotWithServerURL(token, apiBase, onUpdate, httpClient)
+		},
 		token:                 token,
 		allowFrom:             allowFrom,
 		groupReplyAll:         groupReplyAll,
 		shareSessionInChannel: shareSessionInChannel,
 		enableReactions:       enableReactions,
+		reactionEmojis:        reactionEmojis,
 		progressStyle:         progressStyle,
 		httpClient:            httpClient,
+		channelNameCache:      make(map[string]channelNameCacheEntry),
 	}, nil
 }
 
-func (p *Platform) Name() string { return "telegram" }
+func (p *Platform) Name() string { return p.platformID() }
+
+func (p *Platform) platformID() string {
+	if p.platformName == "" {
+		return "telegram"
+	}
+	return p.platformName
+}
 
 // ProgressStyle reports the streaming-progress style for this platform.
 //
@@ -210,6 +305,14 @@ func (p *Platform) ProgressStyle() string {
 		return "compact"
 	}
 	return p.progressStyle
+}
+
+// ProgressUpdateInterval throttles in-place progress edits. Telegram rejects
+// rapid editMessageText with 429 "too many requests / retry after N"; matching
+// stream_preview's default (1500ms) keeps one editable thinking bubble growing
+// instead of fragmenting into per-word messages after the writer fails.
+func (p *Platform) ProgressUpdateInterval() time.Duration {
+	return 1500 * time.Millisecond
 }
 
 func (p *Platform) Start(handler core.MessageHandler) error {
@@ -250,12 +353,17 @@ func (p *Platform) SetLifecycleHandler(h core.PlatformLifecycleHandler) {
 }
 
 func defaultNewBot(token string, onUpdate func(context.Context, *models.Update), httpClient *http.Client) (telegramBot, *models.User, func(context.Context), error) {
+	return newBotWithServerURL(token, telegramAPIBase, onUpdate, httpClient)
+}
+
+func newBotWithServerURL(token, apiBase string, onUpdate func(context.Context, *models.Update), httpClient *http.Client) (telegramBot, *models.User, func(context.Context), error) {
 	handler := func(ctx context.Context, b *tgbot.Bot, update *models.Update) {
 		onUpdate(ctx, update)
 	}
 	opts := []tgbot.Option{
 		tgbot.WithDefaultHandler(handler),
 		tgbot.WithNotAsyncHandlers(),
+		tgbot.WithServerURL(apiBase),
 	}
 	if httpClient != nil {
 		opts = append(opts, tgbot.WithHTTPClient(60*time.Second, httpClient))
@@ -273,7 +381,7 @@ func defaultNewBot(token string, onUpdate func(context.Context, *models.Update),
 
 	// Drain pending updates before starting polling to avoid 409 Conflict.
 	// This clears any outstanding long-poll request from a previous instance.
-	drainPendingUpdates(token, httpClient)
+	drainPendingUpdates(token, apiBase, httpClient)
 
 	return b, me, b.Start, nil
 }
@@ -281,8 +389,8 @@ func defaultNewBot(token string, onUpdate func(context.Context, *models.Update),
 // drainPendingUpdates clears any pending updates on Telegram's side by calling
 // getUpdates with offset=-1. This terminates any outstanding long-poll request
 // from a previous bot instance, preventing 409 Conflict errors on restart.
-func drainPendingUpdates(token string, httpClient *http.Client) {
-	apiURL := "https://api.telegram.org/bot" + token + "/getUpdates?offset=-1&timeout=0"
+func drainPendingUpdates(token, apiBase string, httpClient *http.Client) {
+	apiURL := strings.TrimRight(apiBase, "/") + "/bot" + token + "/getUpdates?offset=-1&timeout=0"
 	client := httpClient
 	if client == nil {
 		client = http.DefaultClient
@@ -409,6 +517,9 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 		return
 	}
 
+	// Warm channel/topic name cache before engine ResolveChannelName runs.
+	p.rememberChannelNamesFromMessage(msg)
+
 	userName := msg.From.Username
 	if userName == "" {
 		userName = strings.TrimSpace(msg.From.FirstName + " " + msg.From.LastName)
@@ -449,7 +560,9 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 
 	rctx := replyContext{chatID: msg.Chat.ID, threadID: threadID, messageID: msg.ID}
 	if p.enableReactions {
-		go p.reactToMessage(ctx, msg.Chat.ID, msg.ID, "⚡")
+		if emoji := p.pickReactionEmoji(); emoji != "" {
+			go p.reactToMessage(ctx, msg.Chat.ID, msg.ID, emoji)
+		}
 	}
 	botName := p.botUsername()
 
@@ -462,7 +575,7 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 		}
 		caption := stripBotMention(msg.Caption, botName)
 		p.dispatchMessage(&core.Message{
-			SessionKey: sessionKey, Platform: "telegram",
+			SessionKey: sessionKey, Platform: p.platformID(),
 			UserID: userID, UserName: userName, ChatName: chatName,
 			Content:    caption,
 			MessageID:  strconv.Itoa(msg.ID),
@@ -481,7 +594,7 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 			return
 		}
 		p.dispatchMessage(&core.Message{
-			SessionKey: sessionKey, Platform: "telegram",
+			SessionKey: sessionKey, Platform: p.platformID(),
 			UserID: userID, UserName: userName, ChatName: chatName,
 			MessageID:  strconv.Itoa(msg.ID),
 			ChannelKey: channelKey,
@@ -511,7 +624,7 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 			}
 		}
 		p.dispatchMessage(&core.Message{
-			SessionKey: sessionKey, Platform: "telegram",
+			SessionKey: sessionKey, Platform: p.platformID(),
 			UserID: userID, UserName: userName, ChatName: chatName,
 			MessageID:  strconv.Itoa(msg.ID),
 			ChannelKey: channelKey,
@@ -535,7 +648,7 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 		}
 		caption := stripBotMention(msg.Caption, botName)
 		p.dispatchMessage(&core.Message{
-			SessionKey: sessionKey, Platform: "telegram",
+			SessionKey: sessionKey, Platform: p.platformID(),
 			UserID: userID, UserName: userName, ChatName: chatName,
 			Content:    caption,
 			MessageID:  strconv.Itoa(msg.ID),
@@ -549,7 +662,7 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 	if msg.Location != nil {
 		slog.Info("telegram: location received", "user", userName, "latitude", msg.Location.Latitude, "longitude", msg.Location.Longitude)
 		p.dispatchMessage(&core.Message{
-			SessionKey: sessionKey, Platform: "telegram",
+			SessionKey: sessionKey, Platform: p.platformID(),
 			UserID: userID, UserName: userName, ChatName: chatName,
 			MessageID:  strconv.Itoa(msg.ID),
 			ChannelKey: channelKey,
@@ -572,7 +685,7 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 	text := stripBotMention(msg.Text, botName)
 	slog.Debug("telegram: message received", "user", userName, "chat", msg.Chat.ID)
 	p.dispatchMessage(&core.Message{
-		SessionKey: sessionKey, Platform: "telegram",
+		SessionKey: sessionKey, Platform: p.platformID(),
 		UserID: userID, UserName: userName, ChatName: chatName,
 		Content:    text,
 		MessageID:  strconv.Itoa(msg.ID),
@@ -613,6 +726,91 @@ func (p *Platform) messageHandler() core.MessageHandler {
 	return p.handler
 }
 
+// defaultTelegramReactionEmojis are Bot API–supported reaction emojis used when
+// enable_reactions is on and no reaction_emoji / reaction_emojis is configured.
+// Keep this list to Telegram's available reaction set so setMessageReaction succeeds.
+var defaultTelegramReactionEmojis = []string{
+	"⚡", "👀", "🔥", "👍", "🎉", "🤔", "👏", "💯", "🤩", "😁", "🫡", "😎", "🏆", "❤",
+}
+
+func parseReactionEmojis(opts map[string]any) []string {
+	if v, ok := opts["reaction_emoji"].(string); ok {
+		v = strings.TrimSpace(v)
+		if strings.EqualFold(v, "none") {
+			return nil
+		}
+		if v != "" {
+			return splitReactionEmojis(v)
+		}
+	}
+	if raw, ok := opts["reaction_emojis"]; ok {
+		switch vv := raw.(type) {
+		case []string:
+			out := make([]string, 0, len(vv))
+			for _, s := range vv {
+				s = strings.TrimSpace(s)
+				if s != "" && !strings.EqualFold(s, "none") {
+					out = append(out, s)
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		case []any:
+			out := make([]string, 0, len(vv))
+			for _, item := range vv {
+				s, ok := item.(string)
+				if !ok {
+					continue
+				}
+				s = strings.TrimSpace(s)
+				if s != "" && !strings.EqualFold(s, "none") {
+					out = append(out, s)
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		case string:
+			s := strings.TrimSpace(vv)
+			if strings.EqualFold(s, "none") {
+				return nil
+			}
+			if s != "" {
+				return splitReactionEmojis(s)
+			}
+		}
+	}
+	return append([]string(nil), defaultTelegramReactionEmojis...)
+}
+
+func splitReactionEmojis(v string) []string {
+	parts := strings.FieldsFunc(v, func(r rune) bool {
+		return r == ',' || r == '|' || r == ';'
+	})
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (p *Platform) pickReactionEmoji() string {
+	if len(p.reactionEmojis) == 0 {
+		return ""
+	}
+	if len(p.reactionEmojis) == 1 {
+		return p.reactionEmojis[0]
+	}
+	return p.reactionEmojis[rand.IntN(len(p.reactionEmojis))]
+}
+
 // reactToMessage sets an emoji reaction on a Telegram message.
 // It is called asynchronously so it never blocks the message dispatch path.
 func (p *Platform) reactToMessage(ctx context.Context, chatID int64, messageID int, emoji string) {
@@ -635,14 +833,14 @@ func (p *Platform) reactToMessage(ctx context.Context, chatID int64, messageID i
 func (p *Platform) buildSessionKey(chatID int64, threadID int, userID int64) string {
 	if p.shareSessionInChannel {
 		if threadID != 0 {
-			return fmt.Sprintf("telegram:%d:%d", chatID, threadID)
+			return fmt.Sprintf("%s:%d:%d", p.platformID(), chatID, threadID)
 		}
-		return fmt.Sprintf("telegram:%d", chatID)
+		return fmt.Sprintf("%s:%d", p.platformID(), chatID)
 	}
 	if threadID != 0 {
-		return fmt.Sprintf("telegram:%d:%d:%d", chatID, threadID, userID)
+		return fmt.Sprintf("%s:%d:%d:%d", p.platformID(), chatID, threadID, userID)
 	}
-	return fmt.Sprintf("telegram:%d:%d", chatID, userID)
+	return fmt.Sprintf("%s:%d:%d", p.platformID(), chatID, userID)
 }
 
 func buildChannelKey(chatID int64, threadID int) string {
@@ -851,7 +1049,7 @@ func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQ
 
 		p.handler(p, &core.Message{
 			SessionKey: sessionKey,
-			Platform:   "telegram",
+			Platform:   p.platformID(),
 			UserID:     userID,
 			UserName:   userName,
 			ChatName:   chatName,
@@ -894,7 +1092,7 @@ func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQ
 
 		p.handler(p, &core.Message{
 			SessionKey: sessionKey,
-			Platform:   "telegram",
+			Platform:   p.platformID(),
 			UserID:     userID,
 			UserName:   userName,
 			ChatName:   chatName,
@@ -945,7 +1143,7 @@ func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQ
 
 	p.handler(p, &core.Message{
 		SessionKey:           sessionKey,
-		Platform:             "telegram",
+		Platform:             p.platformID(),
 		UserID:               userID,
 		UserName:             userName,
 		ChatName:             chatName,
@@ -1044,6 +1242,9 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 	if err != nil {
 		return err
 	}
+	if p.sendRich(ctx, bot, rc, content, true) {
+		return nil
+	}
 
 	html := core.MarkdownToSimpleHTML(content)
 	params := &tgbot.SendMessageParams{
@@ -1091,6 +1292,9 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	bot, err := p.connectedBot("send")
 	if err != nil {
 		return err
+	}
+	if p.sendRich(ctx, bot, rc, content, false) {
+		return nil
 	}
 
 	html := core.MarkdownToSimpleHTML(content)
@@ -1375,8 +1579,8 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 	//   telegram:{chatID}:{userID}             - per-user session, no topic
 	//   telegram:{chatID}:{threadID}:{userID}  - per-user session, with topic
 	parts := strings.SplitN(sessionKey, ":", 5)
-	if len(parts) < 2 || parts[0] != "telegram" {
-		return nil, fmt.Errorf("telegram: invalid session key %q", sessionKey)
+	if len(parts) < 2 || parts[0] != p.platformID() {
+		return nil, fmt.Errorf("%s: invalid session key %q", p.platformID(), sessionKey)
 	}
 	chatID, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
@@ -1474,6 +1678,10 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 	bot, err := p.connectedBot("update message")
 	if err != nil {
 		return err
+	}
+	if p.editRich(ctx, bot, h, content) {
+		slog.Debug("telegram: UpdateMessage rich success")
+		return nil
 	}
 
 	html := core.MarkdownToSimpleHTML(content)
@@ -1817,3 +2025,6 @@ func sanitizeTelegramCommand(cmd string) string {
 }
 
 var _ core.AudioSender = (*Platform)(nil)
+var _ core.ProgressStyleProvider = (*Platform)(nil)
+var _ core.ProgressUpdateThrottler = (*Platform)(nil)
+var _ core.ChannelNameResolver = (*Platform)(nil)

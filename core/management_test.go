@@ -1030,6 +1030,7 @@ func TestResolveGlobalProviderForAgent(t *testing.T) {
 		Models: []struct {
 			Model string `json:"model"`
 			Alias string `json:"alias,omitempty"`
+			Group string `json:"group,omitempty"`
 		}{{Model: "claude-sonnet-4"}, {Model: "claude-opus-4"}},
 	}
 

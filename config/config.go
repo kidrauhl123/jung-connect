@@ -473,6 +473,12 @@ type ProjectConfig struct {
 	Mode    string `toml:"mode,omitempty"`     // "" or "multi-workspace"
 	BaseDir string `toml:"base_dir,omitempty"` // parent dir for workspaces
 	SkipGit *bool  `toml:"skip_git,omitempty"`
+	// FallbackWorkDir is used when a channel/topic has no workspace binding.
+	// Chat continues in this directory (like the old fixed work_dir) without
+	// forcing the init/bind flow. Binding remains optional; after /workspace
+	// unbind the channel falls back here again. Empty disables the fallback
+	// and keeps the conversational init flow.
+	FallbackWorkDir string `toml:"fallback_work_dir,omitempty"`
 	// WorkspaceInitAllowLocalPaths allows /workspace init and the conversational
 	// init flow to bind existing local directories. Default false keeps init
 	// limited to git URLs; use /workspace bind or /workspace route for explicit
@@ -566,6 +572,7 @@ type AgentConfig struct {
 type ProviderModelConfig struct {
 	Model string `toml:"model"`
 	Alias string `toml:"alias,omitempty"`
+	Group string `toml:"group,omitempty"`
 }
 
 type ProviderConfig struct {

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -309,5 +310,126 @@ func TestCompactProgressWriter_DoesNotTransformToolResults(t *testing.T) {
 	}
 	if got := payload.Items[0].Text; got != raw {
 		t.Fatalf("tool result text = %q, want raw %q", got, raw)
+	}
+}
+
+type stubFailingUpdatePlatform struct {
+	stubCompactProgressPlatform
+	updateErr  error
+	failOnce   bool
+	failedOnce bool
+}
+
+func (p *stubFailingUpdatePlatform) UpdateMessage(ctx context.Context, handle any, content string) error {
+	if p.updateErr != nil {
+		if p.failOnce {
+			if !p.failedOnce {
+				p.failedOnce = true
+				return p.updateErr
+			}
+		} else {
+			return p.updateErr
+		}
+	}
+	return p.stubCompactProgressPlatform.UpdateMessage(ctx, handle, content)
+}
+
+func TestCompactProgressWriter_UpsertsSuccessiveThinking(t *testing.T) {
+	p := &stubCompactProgressPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "telegram"},
+		style:              "compact",
+	}
+	w := newCompactProgressWriter(context.Background(), p, "ctx", "grok", LangEnglish, nil)
+
+	if !w.AppendEvent(ProgressEntryThinking, "in", "", "💭 in") {
+		t.Fatal("first thinking AppendEvent() = false")
+	}
+	if !w.AppendEvent(ProgressEntryThinking, "in a", "", "💭 in a") {
+		t.Fatal("second thinking AppendEvent() = false")
+	}
+	if !w.AppendEvent(ProgressEntryThinking, "in a previous", "", "💭 in a previous") {
+		t.Fatal("third thinking AppendEvent() = false")
+	}
+
+	if got := w.content; got != "💭 in a previous" {
+		t.Fatalf("content = %q, want single upserted thinking block", got)
+	}
+	if strings.Count(w.content, "💭") != 1 {
+		t.Fatalf("content should contain one thinking marker, got %q", w.content)
+	}
+	if strings.Contains(w.content, "\n\n") {
+		t.Fatalf("successive thinking should not stack with blank lines, got %q", w.content)
+	}
+
+	// Non-thinking after thinking should append, not replace.
+	if !w.AppendEvent(ProgressEntryToolUse, "pwd", "Bash", "🔧 Bash: pwd") {
+		t.Fatal("tool AppendEvent() = false")
+	}
+	if !strings.Contains(w.content, "💭 in a previous") || !strings.Contains(w.content, "🔧 Bash: pwd") {
+		t.Fatalf("tool should append after thinking, got %q", w.content)
+	}
+	if !w.AppendEvent(ProgressEntryThinking, "next thought", "", "💭 next thought") {
+		t.Fatal("post-tool thinking AppendEvent() = false")
+	}
+	if !strings.Contains(w.content, "💭 in a previous") || !strings.Contains(w.content, "💭 next thought") {
+		t.Fatalf("new thinking block after tool should append, got %q", w.content)
+	}
+}
+
+func TestCompactProgressWriter_RateLimitDoesNotDisableWriter(t *testing.T) {
+	p := &stubFailingUpdatePlatform{
+		stubCompactProgressPlatform: stubCompactProgressPlatform{
+			stubPlatformEngine: stubPlatformEngine{n: "telegram"},
+			style:              "compact",
+		},
+		updateErr: errors.New(`telegram: edit message: too many requests: retry after 105`),
+		failOnce:  true,
+	}
+	w := newCompactProgressWriter(context.Background(), p, "ctx", "grok", LangEnglish, nil)
+
+	if !w.AppendEvent(ProgressEntryThinking, "hello", "", "💭 hello") {
+		t.Fatal("initial AppendEvent() = false")
+	}
+	if len(p.getPreviewStarts()) != 1 {
+		t.Fatalf("preview starts = %d, want 1", len(p.getPreviewStarts()))
+	}
+
+	// Second append triggers UpdateMessage which rate-limits once.
+	ok := w.AppendEvent(ProgressEntryThinking, "hello world", "", "💭 hello world")
+	if !ok {
+		t.Fatal("rate-limited AppendEvent() = false, want true (writer stays active)")
+	}
+	if w.failed {
+		t.Fatal("rate-limit should not set failed=true")
+	}
+	if got := w.content; got != "💭 hello world" {
+		t.Fatalf("content = %q, want latest desired thinking text", got)
+	}
+
+	// Later append should edit successfully after the one-shot failure.
+	if !w.AppendEvent(ProgressEntryThinking, "hello world!", "", "💭 hello world!") {
+		t.Fatal("post-rate-limit AppendEvent() = false")
+	}
+	if w.failed {
+		t.Fatal("writer should still be active after successful retry")
+	}
+	edits := p.getPreviewEdits()
+	if len(edits) < 1 {
+		t.Fatal("expected at least one successful UpdateMessage after rate-limit")
+	}
+	if got := edits[len(edits)-1]; got != "💭 hello world!" {
+		t.Fatalf("last edit = %q, want latest thinking", got)
+	}
+}
+
+func TestIsProgressRateLimitError(t *testing.T) {
+	if !isProgressRateLimitError(errors.New("telegram: edit message: too many requests: retry after 105")) {
+		t.Fatal("expected rate-limit detection")
+	}
+	if isProgressRateLimitError(errors.New("telegram: edit message: message not found")) {
+		t.Fatal("non-rate-limit error should not match")
+	}
+	if isProgressRateLimitError(nil) {
+		t.Fatal("nil should not match")
 	}
 }

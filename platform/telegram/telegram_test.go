@@ -82,10 +82,19 @@ type stubTelegramBot struct {
 	setMyCommandsCalls   int
 	getFileCalls         int
 	setReactionCalls     int
+	sendRichCalls        int
 
-	sendErr    error
-	getFileErr error
-	file       *models.File
+	sendErr     error
+	richErr     error
+	editErr     error
+	editErrOnce bool
+	getFileErr  error
+	getChatErr  error
+	getChatCalls int
+	chatInfo    *models.ChatFullInfo
+	file        *models.File
+	lastRich    string
+	lastEdit    *tgbot.EditMessageTextParams
 }
 
 func newStubTelegramBot() *stubTelegramBot {
@@ -154,12 +163,18 @@ func (b *stubTelegramBot) SendChatAction(_ context.Context, _ *tgbot.SendChatAct
 	return true, nil
 }
 
-func (b *stubTelegramBot) EditMessageText(_ context.Context, _ *tgbot.EditMessageTextParams) (*models.Message, error) {
+func (b *stubTelegramBot) EditMessageText(_ context.Context, params *tgbot.EditMessageTextParams) (*models.Message, error) {
 	b.mu.Lock()
 	b.editMessageTextCalls++
+	copied := *params
+	b.lastEdit = &copied
+	err := b.editErr
+	if err != nil && b.editErrOnce {
+		b.editErr = nil
+	}
 	b.mu.Unlock()
-	if b.sendErr != nil {
-		return nil, b.sendErr
+	if err != nil {
+		return nil, err
 	}
 	return &models.Message{ID: 99}, nil
 }
@@ -210,6 +225,30 @@ func (b *stubTelegramBot) SetMessageReaction(_ context.Context, _ *tgbot.SetMess
 	b.setReactionCalls++
 	b.mu.Unlock()
 	return true, nil
+}
+
+func (b *stubTelegramBot) SendRichMessage(_ context.Context, params *tgbot.SendRichMessageParams) (*models.Message, error) {
+	b.mu.Lock()
+	b.sendRichCalls++
+	b.lastRich = params.RichMessage.Markdown
+	b.mu.Unlock()
+	if b.richErr != nil {
+		return nil, b.richErr
+	}
+	return &models.Message{ID: 77}, nil
+}
+
+func (b *stubTelegramBot) GetChat(_ context.Context, _ *tgbot.GetChatParams) (*models.ChatFullInfo, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.getChatCalls++
+	if b.getChatErr != nil {
+		return nil, b.getChatErr
+	}
+	if b.chatInfo != nil {
+		return b.chatInfo, nil
+	}
+	return &models.ChatFullInfo{ID: -1001, Title: "stub-chat"}, nil
 }
 
 func (b *stubTelegramBot) SendMessageCallCount() int {
@@ -1036,3 +1075,12 @@ func TestProgressStyleProviderInterface(t *testing.T) {
 	}
 }
 
+
+func TestProgressUpdateInterval(t *testing.T) {
+	p := &Platform{}
+	got := p.ProgressUpdateInterval()
+	if got != 1500*time.Millisecond {
+		t.Fatalf("ProgressUpdateInterval() = %v, want 1500ms", got)
+	}
+	var _ core.ProgressUpdateThrottler = p
+}

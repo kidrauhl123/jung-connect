@@ -1,6 +1,7 @@
 package acp
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
@@ -291,5 +292,33 @@ func TestSummarizeACPToolInput(t *testing.T) {
 				t.Errorf("summarizeACPToolInput(%q, %s) = %q, want %q", tt.kind, tt.raw, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestOnNotification_dropsSessionLoadReplay(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &acpSession{events: make(chan core.Event, 4), ctx: ctx}
+	s.loading.Store(true)
+	params := json.RawMessage(`{
+		"sessionId": "s1",
+		"update": {"sessionUpdate": "tool_call", "toolCallId": "c1", "kind": "execute", "title": "Run"}
+	}`)
+	s.onNotification("session/update", params)
+	select {
+	case ev := <-s.events:
+		t.Fatalf("replay emitted %+v", ev)
+	default:
+	}
+
+	s.loading.Store(false)
+	s.onNotification("session/update", params)
+	select {
+	case ev := <-s.events:
+		if ev.Type != core.EventToolUse {
+			t.Fatalf("live event type %v", ev.Type)
+		}
+	default:
+		t.Fatal("live tool_call was dropped")
 	}
 }

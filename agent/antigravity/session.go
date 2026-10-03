@@ -78,18 +78,10 @@ func (as *antigravitySession) Send(prompt string, messageID string, images []cor
 	}
 
 	// Capture existing chat logs so we can identify a new session on first turn
-	preEntries := make(map[string]bool)
-	homeDir, err := os.UserHomeDir()
-	if err == nil {
-		slug := antigravityProjectSlug(as.workDir)
-		chatsDir := filepath.Join(homeDir, ".gemini", "tmp", slug, "chats")
-		if entries, err := os.ReadDir(chatsDir); err == nil {
-			for _, entry := range entries {
-				if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".jsonl") {
-					preEntries[entry.Name()] = true
-				}
-			}
-		}
+	var preEntries map[string]bool
+	sendStartedAt := time.Now()
+	if as.CurrentSessionID() == "" {
+		preEntries = scanPreEntries()
 	}
 
 	// Save images and files into the workspace
@@ -149,10 +141,10 @@ func (as *antigravitySession) Send(prompt string, messageID string, images []cor
 	if as.permissionBridge != nil {
 		agyConfigDir = as.permissionBridge.AgyConfigDir()
 	}
-	args := as.buildAntigravityArgs(chatID, isResume, as.mode, agyConfigDir, fullPrompt)
-	if strings.TrimSpace(as.model) != "" {
-		slog.Warn("antigravitySession: model is configured but ignored because agy does not support --model yet", "model", as.model)
+	if err := ensureAgyCustomModelSettings(as.resolvedAgyModel(), as.extraEnv); err != nil {
+		return fmt.Errorf("antigravity: prepare settings: %w", err)
 	}
+	args := as.buildAntigravityArgs(chatID, isResume, as.mode, agyConfigDir, fullPrompt)
 
 	var ctx context.Context
 	var cancel context.CancelFunc
@@ -173,13 +165,15 @@ func (as *antigravitySession) Send(prompt string, messageID string, images []cor
 	cmd := exec.CommandContext(ctx, as.cmd, args...)
 	cmd.WaitDelay = 1 * time.Second
 	cmd.Dir = as.workDir
-	env := os.Environ()
+	env := dropEnvKey(os.Environ(), "GOOGLE_API_KEY")
 	if len(as.extraEnv) > 0 {
 		env = core.MergeEnv(env, as.extraEnv)
 	}
 	if as.permissionBridge != nil {
 		env = core.MergeEnv(env, as.permissionBridge.Env())
 	}
+	// agy prefers GOOGLE_API_KEY over GEMINI_API_KEY; keep only the latter.
+	env = dropEnvKey(env, "GOOGLE_API_KEY")
 	cmd.Env = env
 
 	// Keep stdin disconnected: agy --print consumes piped stdin to EOF before
@@ -200,9 +194,129 @@ func (as *antigravitySession) Send(prompt string, messageID string, images []cor
 	as.wg.Add(1)
 	go func() {
 		defer cancel()
-		as.readLoop(ctx, cmd, stdout, &stderrBuf, append(imageRefs, fileRefs...), preEntries, time.Now())
+		as.readLoop(ctx, cmd, stdout, &stderrBuf, append(imageRefs, fileRefs...), preEntries, sendStartedAt)
 	}()
 
+	return nil
+}
+
+func dropEnvKey(env []string, key string) []string {
+	if key == "" {
+		return env
+	}
+	prefix := key + "="
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		if e == key || strings.HasPrefix(e, prefix) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func (as *antigravitySession) resolvedAgyModel() string {
+	return strings.TrimSpace(as.model)
+}
+
+func envLookup(env []string, key string) string {
+	prefix := key + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return strings.TrimPrefix(e, prefix)
+		}
+	}
+	return ""
+}
+
+func isAgyStockModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" || strings.Contains(m, "://") {
+		return false
+	}
+	return strings.HasPrefix(m, "gemini-") ||
+		strings.HasPrefix(m, "claude-") ||
+		strings.HasPrefix(m, "gpt-oss-")
+}
+
+// ensureAgyCustomModelSettings points agy at a Gemini-compatible gateway
+// (New API) and registers non-stock slugs so --model grok-... is accepted.
+// Stock Gemini/Claude/GPT-OSS ids must stay unregistered: agy's custom-model
+// path 400s several of them. gemini-api://local/models/<id> is not a valid
+// --model value on agy 1.2.x.
+func ensureAgyCustomModelSettings(model string, extraEnv []string) error {
+	if envLookup(extraEnv, "GEMINI_API_KEY") == "" && envLookup(extraEnv, "GOOGLE_GEMINI_BASE_URL") == "" {
+		return nil
+	}
+	dataDir, err := antigravityDataDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return fmt.Errorf("create agy data dir: %w", err)
+	}
+	path := filepath.Join(dataDir, "settings.json")
+	current := map[string]any{}
+	if raw, err := os.ReadFile(path); err == nil && len(raw) > 0 {
+		if err := json.Unmarshal(raw, &current); err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+
+	current["modelProvider"] = "gemini"
+	model = strings.TrimSpace(model)
+	if model != "" && !isAgyStockModel(model) {
+		cfg, _ := current["customModelsConfig"].(map[string]any)
+		if cfg == nil {
+			cfg = map[string]any{}
+		}
+		models, _ := cfg["customModels"].(map[string]any)
+		if models == nil {
+			models = map[string]any{}
+		}
+		if existing, ok := models[model]; !ok {
+			models[model] = map[string]any{"modelName": model}
+		} else if m, ok := existing.(map[string]any); ok {
+			if strings.TrimSpace(fmt.Sprint(m["modelName"])) == "" {
+				m["modelName"] = model
+				models[model] = m
+			}
+		}
+		cfg["customModels"] = models
+		current["customModelsConfig"] = cfg
+	}
+
+	data, err := json.MarshalIndent(current, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal agy settings: %w", err)
+	}
+	data = append(data, '\n')
+	tmp, err := os.CreateTemp(dataDir, "settings.json.*")
+	if err != nil {
+		return fmt.Errorf("create agy settings temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("write agy settings temp: %w", err)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("chmod agy settings temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("close agy settings temp: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("replace %s: %w", path, err)
+	}
+	slog.Info("antigravitySession: agy settings ready", "path", path, "model", model, "stock", isAgyStockModel(model))
 	return nil
 }
 
@@ -216,6 +330,9 @@ func (as *antigravitySession) buildAntigravityArgs(chatID string, isResume bool,
 	}
 	if isResume {
 		args = append(args, "--conversation", chatID)
+	}
+	if model := strings.TrimSpace(as.resolvedAgyModel()); model != "" {
+		args = append(args, "--model", model)
 	}
 	switch mode {
 	case "yolo":
@@ -241,12 +358,12 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 		// for process reaping before scanning the chat directory.
 		if as.CurrentSessionID() == "" {
 			var sid string
-			for attempt := 0; attempt < 15; attempt++ {
+			for attempt := 0; attempt < 25; attempt++ {
 				sid = as.detectNewSessionID(preEntries, sendStartedAt)
 				if sid != "" {
 					break
 				}
-				time.Sleep(20 * time.Millisecond)
+				time.Sleep(50 * time.Millisecond)
 			}
 			if sid != "" {
 				as.chatID.Store(sid)
@@ -309,15 +426,56 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 	}
 }
 
-func (as *antigravitySession) detectNewSessionID(preEntries map[string]bool, sendStartedAt time.Time) string {
+func antigravityDataDir() (string, error) {
+	if dir := os.Getenv("ANTIGRAVITY_APP_DATA_DIR"); dir != "" {
+		return dir, nil
+	}
+	if dir := os.Getenv("AGY_APP_DATA_DIR"); dir != "" {
+		return dir, nil
+	}
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("antigravity: cannot determine home dir: %w", err)
 	}
-	slug := antigravityProjectSlug(as.workDir)
-	chatsDir := filepath.Join(homeDir, ".gemini", "tmp", slug, "chats")
+	return filepath.Join(homeDir, ".gemini", "antigravity-cli"), nil
+}
 
-	entries, err := os.ReadDir(chatsDir)
+func scanPreEntries() map[string]bool {
+	pre := make(map[string]bool)
+	dataDir, err := antigravityDataDir()
+	if err != nil {
+		return pre
+	}
+
+	// Scan brain/ directory
+	brainDir := filepath.Join(dataDir, "brain")
+	if entries, err := os.ReadDir(brainDir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+				pre[e.Name()] = true
+			}
+		}
+	}
+
+	// Scan conversations/ directory
+	convDir := filepath.Join(dataDir, "conversations")
+	if entries, err := os.ReadDir(convDir); err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if strings.HasSuffix(name, ".db") {
+				id := strings.TrimSuffix(name, ".db")
+				if id != "" && !strings.HasPrefix(id, ".") {
+					pre[id] = true
+				}
+			}
+		}
+	}
+
+	return pre
+}
+
+func (as *antigravitySession) detectNewSessionID(preEntries map[string]bool, sendStartedAt time.Time) string {
+	dataDir, err := antigravityDataDir()
 	if err != nil {
 		return ""
 	}
@@ -327,61 +485,93 @@ func (as *antigravitySession) detectNewSessionID(preEntries map[string]bool, sen
 		modTime   time.Time
 		diff      time.Duration
 	}
+
 	var candidates []candidate
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
-			continue
+	seen := make(map[string]bool)
+
+	checkCandidate := func(id string, modTime time.Time) {
+		if id == "" || strings.HasPrefix(id, ".") || preEntries[id] || seen[id] {
+			return
 		}
-		if preEntries[entry.Name()] {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		mod := info.ModTime()
-		if !sendStartedAt.IsZero() && mod.Before(sendStartedAt.Add(-2*time.Second)) {
-			continue
+		seen[id] = true
+
+		if !sendStartedAt.IsZero() && modTime.Before(sendStartedAt.Add(-2*time.Second)) {
+			return
 		}
 
-		fpath := filepath.Join(chatsDir, entry.Name())
-		file, err := os.Open(fpath)
-		if err != nil {
-			continue
-		}
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-		if scanner.Scan() {
-			var sf struct {
-				SessionID string `json:"sessionId"`
-			}
-			if json.Unmarshal([]byte(scanner.Text()), &sf) == nil && sf.SessionID != "" {
-				diff := time.Duration(0)
-				if !sendStartedAt.IsZero() {
-					if mod.After(sendStartedAt) {
-						diff = mod.Sub(sendStartedAt)
-					} else {
-						diff = sendStartedAt.Sub(mod)
-					}
-				}
-				candidates = append(candidates, candidate{
-					sessionID: sf.SessionID,
-					modTime:   mod,
-					diff:      diff,
-				})
+		diff := time.Duration(0)
+		if !sendStartedAt.IsZero() {
+			if modTime.After(sendStartedAt) {
+				diff = modTime.Sub(sendStartedAt)
+			} else {
+				diff = sendStartedAt.Sub(modTime)
 			}
 		}
-		_ = file.Close()
+
+		candidates = append(candidates, candidate{
+			sessionID: id,
+			modTime:   modTime,
+			diff:      diff,
+		})
 	}
+
+	// 1. Scan brain/
+	brainDir := filepath.Join(dataDir, "brain")
+	if entries, err := os.ReadDir(brainDir); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+				continue
+			}
+			id := entry.Name()
+			if preEntries[id] {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			modTime := info.ModTime()
+			transcriptPath := filepath.Join(brainDir, id, ".system_generated", "logs", "transcript.jsonl")
+			if tInfo, err := os.Stat(transcriptPath); err == nil {
+				if tInfo.ModTime().After(modTime) {
+					modTime = tInfo.ModTime()
+				}
+			}
+			checkCandidate(id, modTime)
+		}
+	}
+
+	// 2. Scan conversations/
+	convDir := filepath.Join(dataDir, "conversations")
+	if entries, err := os.ReadDir(convDir); err == nil {
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() || !strings.HasSuffix(name, ".db") {
+				continue
+			}
+			id := strings.TrimSuffix(name, ".db")
+			if preEntries[id] || seen[id] {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			checkCandidate(id, info.ModTime())
+		}
+	}
+
 	if len(candidates) == 0 {
 		return ""
 	}
+
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].diff == candidates[j].diff {
 			return candidates[i].modTime.After(candidates[j].modTime)
 		}
 		return candidates[i].diff < candidates[j].diff
 	})
+
 	return candidates[0].sessionID
 }
 

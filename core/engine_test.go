@@ -4516,8 +4516,16 @@ func TestCmdModel_UsesInlineButtonsOnButtonOnlyPlatform(t *testing.T) {
 	if len(p.buttonRows) == 0 {
 		t.Fatal("expected /model to send inline buttons on button-only platform")
 	}
+	if got := p.buttonRows[0][0].Data; got != "cmd:/model vendor o" {
+		t.Fatalf("first /model button = %q, want vendor picker %q", got, "cmd:/model vendor o")
+	}
+
+	e.cmdModel(p, &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}, []string{"vendor", "o"})
+	if len(p.buttonRows) == 0 {
+		t.Fatal("expected vendor page to send model buttons")
+	}
 	if got := p.buttonRows[0][0].Data; got != "cmd:/model switch 1" {
-		t.Fatalf("first /model button = %q, want %q", got, "cmd:/model switch 1")
+		t.Fatalf("first vendor-page button = %q, want %q", got, "cmd:/model switch 1")
 	}
 }
 
@@ -4737,14 +4745,30 @@ func TestCmdModel_MultiWorkspaceUsesWorkspaceAgentAndSessions(t *testing.T) {
 	}
 }
 
-func TestCmdModel_MultiWorkspaceSwitchDoesNotMutateProviderModel(t *testing.T) {
+func TestCmdModel_MultiWorkspaceSwitchUpdatesRuntimeProviderModelWithoutConfigSave(t *testing.T) {
 	p := &stubPlatformEngine{n: "plain"}
-	globalAgent := &stubModelModeAgent{model: "gpt-4.1-mini"}
+	globalAgent := &stubModelModeAgent{
+		model: "gpt-4.1-mini",
+		providers: []ProviderConfig{{
+			Name:   "openai",
+			Model:  "gpt-4.1-mini",
+			Models: []ModelOption{{Name: "gpt-4.1", Alias: "gpt"}, {Name: "gpt-4.1-mini", Alias: "mini"}},
+		}},
+		active: "openai",
+	}
 	e := NewEngine("test", globalAgent, []Platform{p}, "", LangEnglish)
+	e.SetProjectStateStore(NewProjectStateStore(filepath.Join(t.TempDir(), "projects", "test.state.json")))
 
 	baseDir := t.TempDir()
 	bindingPath := filepath.Join(t.TempDir(), "bindings.json")
 	e.SetMultiWorkspace(baseDir, bindingPath)
+
+	var savedProvider, savedModel string
+	e.SetProviderModelSaveFunc(func(providerName, model string) error {
+		savedProvider = providerName
+		savedModel = model
+		return nil
+	})
 
 	wsDir := normalizeWorkspacePath(t.TempDir())
 	channelID := "C-model-provider"
@@ -4770,8 +4794,136 @@ func TestCmdModel_MultiWorkspaceSwitchDoesNotMutateProviderModel(t *testing.T) {
 	if wsAgent.model != "gpt-4.1" {
 		t.Fatalf("workspace agent model = %q, want gpt-4.1", wsAgent.model)
 	}
-	if got := wsAgent.GetActiveProvider(); got == nil || got.Model != "gpt-4.1-mini" {
-		t.Fatalf("workspace active provider = %#v, want unchanged model gpt-4.1-mini", got)
+	if got := wsAgent.GetActiveProvider(); got == nil || got.Model != "gpt-4.1" {
+		t.Fatalf("workspace active provider = %#v, want runtime model gpt-4.1", got)
+	}
+	if savedProvider != "" || savedModel != "" {
+		t.Fatalf("config save called with provider=%q model=%q, want no toml write in multi-workspace", savedProvider, savedModel)
+	}
+	if globalAgent.model != "gpt-4.1-mini" {
+		t.Fatalf("global agent model = %q, want unchanged", globalAgent.model)
+	}
+	if got := globalAgent.GetActiveProvider(); got == nil || got.Model != "gpt-4.1-mini" {
+		t.Fatalf("global active provider = %#v, want unchanged gpt-4.1-mini", got)
+	}
+	if got := e.projectState.WorkspaceModelOverride(wsDir); got != "gpt-4.1" {
+		t.Fatalf("WorkspaceModelOverride(%q) = %q, want gpt-4.1", wsDir, got)
+	}
+}
+
+func TestCmdModel_MultiWorkspaceIsolationBetweenWorkspacesAndGlobal(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	globalAgent := &stubModelModeAgent{
+		model: "global-default",
+		providers: []ProviderConfig{{
+			Name:   "openai",
+			Model:  "global-default",
+			Models: []ModelOption{{Name: "gpt-4.1", Alias: "gpt"}, {Name: "gpt-4.1-mini", Alias: "mini"}, {Name: "global-default"}},
+		}},
+		active: "openai",
+	}
+	e := NewEngine("test", globalAgent, []Platform{p}, "", LangEnglish)
+	e.SetProjectStateStore(NewProjectStateStore(filepath.Join(t.TempDir(), "projects", "test.state.json")))
+
+	baseDir := t.TempDir()
+	e.SetMultiWorkspace(baseDir, filepath.Join(t.TempDir(), "bindings.json"))
+	fallback := normalizeWorkspacePath(t.TempDir())
+	e.SetFallbackWorkDir(fallback)
+
+	var savedProvider, savedModel string
+	e.SetProviderModelSaveFunc(func(providerName, model string) error {
+		savedProvider = providerName
+		savedModel = model
+		return nil
+	})
+	e.SetModelSaveFunc(func(model string) error {
+		savedModel = model
+		return nil
+	})
+
+	boundDir := normalizeWorkspacePath(t.TempDir())
+	boundChannel := "C-bound-89"
+	e.workspaceBindings.Bind("project:test", boundChannel, "bound", boundDir)
+
+	// Pre-create agents so we can assert GetModel isolation directly.
+	boundWS := e.workspacePool.GetOrCreate(boundDir)
+	boundAgent := &stubModelModeAgent{
+		model: "global-default",
+		providers: []ProviderConfig{{
+			Name:   "openai",
+			Model:  "global-default",
+			Models: []ModelOption{{Name: "gpt-4.1", Alias: "gpt"}, {Name: "gpt-4.1-mini", Alias: "mini"}, {Name: "global-default"}},
+		}},
+		active: "openai",
+	}
+	boundWS.agent = boundAgent
+	boundWS.sessions = NewSessionManager("")
+
+	fbWS := e.workspacePool.GetOrCreate(fallback)
+	fbAgent := &stubModelModeAgent{
+		model: "global-default",
+		providers: []ProviderConfig{{
+			Name:   "openai",
+			Model:  "global-default",
+			Models: []ModelOption{{Name: "gpt-4.1", Alias: "gpt"}, {Name: "gpt-4.1-mini", Alias: "mini"}, {Name: "global-default"}},
+		}},
+		active: "openai",
+	}
+	fbWS.agent = fbAgent
+	fbWS.sessions = NewSessionManager("")
+
+	boundMsg := &Message{SessionKey: "feishu:" + boundChannel + ":u1", ReplyCtx: "ctx", ChannelKey: boundChannel, Platform: "feishu"}
+	e.cmdModel(p, boundMsg, []string{"switch", "gpt"})
+
+	if boundAgent.model != "gpt-4.1" {
+		t.Fatalf("bound workspace model = %q, want gpt-4.1", boundAgent.model)
+	}
+	if got := boundAgent.GetActiveProvider(); got == nil || got.Model != "gpt-4.1" {
+		t.Fatalf("bound provider model = %#v, want gpt-4.1", got)
+	}
+	if fbAgent.model != "global-default" {
+		t.Fatalf("fallback workspace model = %q, want unchanged global-default", fbAgent.model)
+	}
+	if got := fbAgent.GetActiveProvider(); got == nil || got.Model != "global-default" {
+		t.Fatalf("fallback provider model = %#v, want unchanged global-default", got)
+	}
+	if globalAgent.model != "global-default" {
+		t.Fatalf("global agent model = %q, want unchanged", globalAgent.model)
+	}
+	if got := globalAgent.GetActiveProvider(); got == nil || got.Model != "global-default" {
+		t.Fatalf("global provider model = %#v, want unchanged", got)
+	}
+	if savedProvider != "" || savedModel != "" {
+		t.Fatalf("unexpected config save provider=%q model=%q", savedProvider, savedModel)
+	}
+
+	// Switch model on unbound/fallback topic — must not affect bound workspace or global.
+	fbMsg := &Message{SessionKey: "feishu:C-general:u1", ReplyCtx: "ctx", ChannelKey: "C-general", Platform: "feishu"}
+	e.cmdModel(p, fbMsg, []string{"switch", "gpt-4.1-mini"})
+
+	if fbAgent.model != "gpt-4.1-mini" {
+		t.Fatalf("fallback workspace model = %q, want gpt-4.1-mini", fbAgent.model)
+	}
+	if got := fbAgent.GetActiveProvider(); got == nil || got.Model != "gpt-4.1-mini" {
+		t.Fatalf("fallback provider model = %#v, want gpt-4.1-mini", got)
+	}
+	if boundAgent.model != "gpt-4.1" {
+		t.Fatalf("bound workspace model = %q after fallback switch, want still gpt-4.1", boundAgent.model)
+	}
+	if got := boundAgent.GetActiveProvider(); got == nil || got.Model != "gpt-4.1" {
+		t.Fatalf("bound provider model = %#v after fallback switch, want still gpt-4.1", got)
+	}
+	if globalAgent.model != "global-default" {
+		t.Fatalf("global agent model = %q after fallback switch, want unchanged", globalAgent.model)
+	}
+	if savedProvider != "" || savedModel != "" {
+		t.Fatalf("unexpected config save after fallback switch provider=%q model=%q", savedProvider, savedModel)
+	}
+	if got := e.projectState.WorkspaceModelOverride(boundDir); got != "gpt-4.1" {
+		t.Fatalf("bound override = %q, want gpt-4.1", got)
+	}
+	if got := e.projectState.WorkspaceModelOverride(fallback); got != "gpt-4.1-mini" {
+		t.Fatalf("fallback override = %q, want gpt-4.1-mini", got)
 	}
 }
 

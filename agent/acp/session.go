@@ -29,6 +29,11 @@ type acpSession struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	alive   atomic.Bool
+	// loading is set while session/load waits for its result. Grok replays the
+	// whole transcript as session/update notifications before that result.
+	// Emitting them blocks this read loop — nothing consumes events until
+	// handshake returns — the stdout pipe fills, and the agent is left a zombie.
+	loading atomic.Bool
 
 	cmd *exec.Cmd
 	tr  *transport
@@ -72,6 +77,8 @@ type acpSessionConfig struct {
 	resumeSessionID string
 	authMethod      string
 	initialMode     string           // if non-empty, applied via session/set_mode after session/new
+	initialModel    string           // if non-empty, applied via session/set_config_option after handshake
+	initialEffort   string           // if non-empty, applied via session/set_config_option configId=reasoning_effort
 	callbacks       sessionCallbacks // may be nil
 }
 
@@ -155,6 +162,27 @@ func newACPSession(ctx context.Context, cfg acpSessionConfig) (*acpSession, erro
 		}
 	}
 
+	// Apply pending model preference after handshake. Important on
+	// session/load resume where CLI `-m` alone may not override the
+	// session's previously selected model.
+	if strings.TrimSpace(cfg.initialModel) != "" {
+		if ok := s.SetLiveModel(cfg.initialModel); !ok {
+			slog.Warn("acp: initial model could not be applied",
+				"model", cfg.initialModel,
+				"session_id", s.currentACPSessionID(),
+			)
+		}
+	}
+
+	if strings.TrimSpace(cfg.initialEffort) != "" {
+		if ok := s.SetLiveReasoningEffort(cfg.initialEffort); !ok {
+			slog.Warn("acp: initial reasoning effort could not be applied",
+				"reasoning_effort", cfg.initialEffort,
+				"session_id", s.currentACPSessionID(),
+			)
+		}
+	}
+
 	return s, nil
 }
 
@@ -211,7 +239,9 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 			"cwd":        s.workDir,
 			"mcpServers": []any{},
 		}
+		s.loading.Store(true)
 		loadRes, err := s.tr.call(s.ctx, "session/load", loadParams)
+		s.loading.Store(false)
 		if err != nil {
 			slog.Warn("acp: session/load failed, starting new session", "error", err)
 		} else {
@@ -344,6 +374,59 @@ func (s *acpSession) SetLiveMode(mode string) bool {
 	return true
 }
 
+// SetLiveModel applies a model change to the running session via
+// `session/set_config_option` with configId=model. Grok ACP expects the
+// nested value shape `{ "value": "<model-id>" }`.
+func (s *acpSession) SetLiveModel(model string) bool {
+	if !s.alive.Load() {
+		return false
+	}
+	sid := s.currentACPSessionID()
+	model = strings.TrimSpace(model)
+	if sid == "" || model == "" {
+		return false
+	}
+	if _, err := s.tr.call(s.ctx, "session/set_config_option", map[string]any{
+		"sessionId": sid,
+		"configId":  "model",
+		"value":     map[string]any{"value": model},
+	}); err != nil {
+		slog.Warn("acp: session/set_config_option model failed",
+			"model", model,
+			"session_id", sid,
+			"error", err,
+		)
+		return false
+	}
+	slog.Info("acp: live model applied", "model", model, "session_id", sid)
+	return true
+}
+
+func (s *acpSession) SetLiveReasoningEffort(effort string) bool {
+	if !s.alive.Load() {
+		return false
+	}
+	sid := s.currentACPSessionID()
+	effort = normalizeReasoningEffort(effort)
+	if sid == "" || effort == "" {
+		return false
+	}
+	if _, err := s.tr.call(s.ctx, "session/set_config_option", map[string]any{
+		"sessionId": sid,
+		"configId":  "reasoning_effort",
+		"value":     map[string]any{"value": effort},
+	}); err != nil {
+		slog.Warn("acp: session/set_config_option reasoning_effort failed",
+			"reasoning_effort", effort,
+			"session_id", sid,
+			"error", err,
+		)
+		return false
+	}
+	slog.Info("acp: live reasoning effort applied", "reasoning_effort", effort, "session_id", sid)
+	return true
+}
+
 // matchAvailableMode resolves a user-typed mode string to a known ACP
 // modeId from the cached availableModes list. Matching is case-
 // insensitive on both id and display name to accommodate IM input.
@@ -368,6 +451,10 @@ func (s *acpSession) matchAvailableMode(input string) string {
 func (s *acpSession) onNotification(method string, params json.RawMessage) {
 	if method != "session/update" {
 		slog.Debug("acp: notification", "method", method)
+		return
+	}
+	if s.loading.Load() {
+		s.maybeAbsorbCurrentModeUpdate(params)
 		return
 	}
 	s.cacheToolCallInput(params)

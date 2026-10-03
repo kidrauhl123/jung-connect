@@ -5,11 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 
@@ -213,14 +211,16 @@ func (a *Agent) configuredModels() []core.ModelOption {
 }
 
 func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
+	configured := a.configuredModels()
+	// Prefer live New API /v1/models (menu must track gateway); toml entries stay as aliases.
+	if models := a.fetchModelsFromAPI(ctx); len(models) > 0 {
+		return core.MergeModelAliases(models, configured)
+	}
 	if models := readCodexModelCatalog(); len(models) > 0 {
 		return models
 	}
-	if models := a.configuredModels(); len(models) > 0 {
-		return models
-	}
-	if models := a.fetchModelsFromAPI(ctx); len(models) > 0 {
-		return models
+	if len(configured) > 0 {
+		return configured
 	}
 	if models := readCodexCachedModels(); len(models) > 0 {
 		return models
@@ -285,62 +285,49 @@ func isCodexChatModel(id string) bool {
 }
 
 func (a *Agent) fetchModelsFromAPI(ctx context.Context) []core.ModelOption {
-	a.mu.Lock()
+	a.mu.RLock()
 	apiKey := ""
 	baseURL := ""
 	if a.activeIdx >= 0 && a.activeIdx < len(a.providers) {
 		apiKey = a.providers[a.activeIdx].APIKey
 		baseURL = a.providers[a.activeIdx].BaseURL
 	}
-	a.mu.Unlock()
+	a.mu.RUnlock()
 
-	if apiKey == "" {
-		apiKey = os.Getenv("OPENAI_API_KEY")
-	}
+	baseURL, apiKey = core.ResolveModelsAPICreds(baseURL, apiKey)
 	if apiKey == "" {
 		return nil
-	}
-	if baseURL == "" {
-		baseURL = os.Getenv("OPENAI_BASE_URL")
 	}
 	if baseURL == "" {
 		baseURL = "https://api.openai.com"
 	}
-	baseURL = strings.TrimRight(baseURL, "/")
-
-	req, err := http.NewRequestWithContext(ctx, "GET", baseURL+"/v1/models", nil)
-	if err != nil {
+	raw := core.FetchOpenAICompatibleModels(ctx, baseURL, apiKey)
+	if len(raw) == 0 {
 		return nil
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		slog.Debug("codex: failed to fetch models", "error", err)
-		return nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-
-	var result struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil
-	}
-
+	// New API returns multi-vendor chat models; only drop obvious non-chat modalities.
 	var models []core.ModelOption
-	for _, m := range result.Data {
-		if isCodexChatModel(m.ID) {
-			models = append(models, core.ModelOption{Name: m.ID})
+	for _, m := range raw {
+		if isNewAPIChatModel(m.Name) {
+			models = append(models, m)
 		}
 	}
-	sort.Slice(models, func(i, j int) bool { return models[i].Name < models[j].Name })
 	return models
+}
+
+// isNewAPIChatModel accepts any chat-capable id from an OpenAI-compatible gateway
+// (Claude/Grok/Gemini/DeepSeek/mimo/GPT/…). Rejects embeddings/audio/image modalities.
+func isNewAPIChatModel(id string) bool {
+	if id == "" {
+		return false
+	}
+	lower := strings.ToLower(id)
+	for _, s := range nonChatSubstrings {
+		if strings.Contains(lower, s) {
+			return false
+		}
+	}
+	return true
 }
 
 func readCodexCachedModels() []core.ModelOption {

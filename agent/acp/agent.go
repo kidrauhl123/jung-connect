@@ -2,13 +2,19 @@ package acp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -34,6 +40,15 @@ type Agent struct {
 	// session/new. Empty means "use whatever the agent selects by default".
 	mode string
 
+	// model is the pending model id to apply to new sessions.
+	// When set, StartSession injects `-m <model>` into the subprocess argv
+	// and applies it via session/set_config_option after handshake.
+	model string
+
+	// reasoningEffort is applied to new sessions via session/set_config_option
+	// configId=reasoning_effort. Empty means leave the agent's default.
+	reasoningEffort string
+
 	// listUnsupported caches a negative result after we probe the agent
 	// for sessionCapabilities.list once. Eliminates spawn cost on
 	// subsequent `/ls` invocations against agents that don't implement
@@ -45,9 +60,9 @@ type Agent struct {
 	// handshake so that future PermissionModes() calls can reflect the
 	// actual modes this specific ACP agent offers (rather than a
 	// hard-coded fallback that may not match).
-	modesMu       sync.RWMutex
-	modesCache    []core.PermissionModeInfo
-	modesCurrent  string
+	modesMu      sync.RWMutex
+	modesCache   []core.PermissionModeInfo
+	modesCurrent string
 
 	mu sync.RWMutex
 }
@@ -64,10 +79,16 @@ type sessionCallbacks interface {
 // Ensure *Agent satisfies sessionCallbacks at compile time.
 var _ sessionCallbacks = (*Agent)(nil)
 
+// Ensure *Agent satisfies ModelSwitcher at compile time.
+var _ core.ModelSwitcher = (*Agent)(nil)
+
+// Ensure *Agent satisfies ReasoningEffortSwitcher at compile time.
+var _ core.ReasoningEffortSwitcher = (*Agent)(nil)
+
 // New builds an acp agent from project options.
 // Required: options["command"] — executable name or path for the ACP agent.
 // Optional: options["args"], options["env"], options["auth_method"],
-// options["display_name"], options["mode"].
+// options["display_name"], options["mode"], options["model"].
 func New(opts map[string]any) (core.Agent, error) {
 	workDir, _ := opts["work_dir"].(string)
 	if workDir == "" {
@@ -93,17 +114,23 @@ func New(opts map[string]any) (core.Agent, error) {
 	}
 	mode, _ := opts["mode"].(string)
 	mode = strings.TrimSpace(mode)
+	model, _ := opts["model"].(string)
+	model = strings.TrimSpace(model)
+	reasoningEffort, _ := opts["reasoning_effort"].(string)
+	reasoningEffort = normalizeReasoningEffort(reasoningEffort)
 
 	return &Agent{
-		workDir:     workDir,
-		cmd:          cmdStr,
-		cliExtraArgs: cliExtraArgs,
-		args:        args,
-		staticEnv:   staticEnv,
-		extraEnv:    extra,
-		authMethod:  authMethod,
-		displayName: displayName,
-		mode:        mode,
+		workDir:         workDir,
+		cmd:             cmdStr,
+		cliExtraArgs:    cliExtraArgs,
+		args:            args,
+		staticEnv:       staticEnv,
+		extraEnv:        extra,
+		authMethod:      authMethod,
+		displayName:     displayName,
+		mode:            mode,
+		model:           model,
+		reasoningEffort: reasoningEffort,
 	}, nil
 }
 
@@ -213,6 +240,12 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	if a.displayName != "" {
 		opts["display_name"] = a.displayName
 	}
+	if a.model != "" {
+		opts["model"] = a.model
+	}
+	if a.reasoningEffort != "" {
+		opts["reasoning_effort"] = a.reasoningEffort
+	}
 	return opts
 }
 
@@ -229,9 +262,13 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	workDir := a.workDir
 	authMethod := a.authMethod
 	pendingMode := a.mode
+	pendingModel := a.model
+	pendingEffort := a.reasoningEffort
 	extra := append([]string(nil), a.extraEnv...)
 	extra = append(extra, a.sessionEnv...)
 	a.mu.RUnlock()
+
+	allArgs = injectModelArgs(allArgs, pendingModel)
 
 	return newACPSession(ctx, acpSessionConfig{
 		command:         command,
@@ -241,6 +278,8 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		resumeSessionID: sessionID,
 		authMethod:      authMethod,
 		initialMode:     pendingMode,
+		initialModel:    pendingModel,
+		initialEffort:   pendingEffort,
 		callbacks:       a,
 	})
 }
@@ -263,6 +302,244 @@ func (a *Agent) CLIDisplayName() string {
 		return "ACP"
 	}
 	return n
+}
+
+// -- ModelSwitcher --
+//
+// Grok ACP (and other OpenAI-compatible ACP agents) accept `-m <model>` on
+// the CLI and `session/set_config_option` with configId=model after handshake.
+// The engine closes the live session after SetModel; the next StartSession
+// resumes with the new model via argv injection + set_config_option.
+
+func (a *Agent) SetModel(model string) {
+	a.mu.Lock()
+	a.model = strings.TrimSpace(model)
+	a.mu.Unlock()
+	slog.Info("acp: model changed for future sessions", "model", strings.TrimSpace(model))
+}
+
+func (a *Agent) GetModel() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.model
+}
+
+func normalizeReasoningEffort(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "minimal", "low", "medium", "high", "xhigh":
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return ""
+	}
+}
+
+func (a *Agent) SetReasoningEffort(effort string) {
+	effort = normalizeReasoningEffort(effort)
+	a.mu.Lock()
+	a.reasoningEffort = effort
+	a.mu.Unlock()
+	slog.Info("acp: reasoning effort changed for future sessions", "reasoning_effort", effort)
+}
+
+func (a *Agent) GetReasoningEffort() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.reasoningEffort
+}
+
+func (a *Agent) AvailableReasoningEfforts() []string {
+	return []string{"minimal", "low", "medium", "high", "xhigh"}
+}
+
+func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
+	if models := a.fetchModelsFromAPI(ctx); len(models) > 0 {
+		return models
+	}
+	if models := fetchModelsFromGrokCLI(ctx); len(models) > 0 {
+		return models
+	}
+	return acpFallbackModels()
+}
+
+func (a *Agent) envLookup(key string) string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.staticEnv != nil {
+		if v := strings.TrimSpace(a.staticEnv[key]); v != "" {
+			return v
+		}
+	}
+	return strings.TrimSpace(os.Getenv(key))
+}
+
+func (a *Agent) fetchModelsFromAPI(ctx context.Context) []core.ModelOption {
+	apiKey := a.envLookup("XAI_API_KEY")
+	if apiKey == "" {
+		return nil
+	}
+	baseURL := a.envLookup("GROK_MODELS_BASE_URL")
+	if baseURL == "" {
+		baseURL = a.envLookup("OPENAI_BASE_URL")
+	}
+	if baseURL == "" {
+		return nil
+	}
+	baseURL = strings.TrimRight(baseURL, "/")
+	url := baseURL + "/models"
+
+	reqCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		slog.Debug("acp: fetch models API failed", "error", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		slog.Debug("acp: fetch models API non-OK", "status", resp.StatusCode)
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil
+	}
+	var result struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil
+	}
+	var models []core.ModelOption
+	seen := make(map[string]struct{})
+	for _, m := range result.Data {
+		id := strings.TrimSpace(m.ID)
+		if !isGrokChatModel(id) {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		models = append(models, core.ModelOption{Name: id})
+	}
+	sort.Slice(models, func(i, j int) bool { return models[i].Name < models[j].Name })
+	return models
+}
+
+func fetchModelsFromGrokCLI(ctx context.Context) []core.ModelOption {
+	path, err := exec.LookPath("grok")
+	if err != nil {
+		return nil
+	}
+	cmdCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cmdCtx, path, "models")
+	out, err := cmd.Output()
+	if err != nil {
+		slog.Debug("acp: grok models failed", "error", err)
+		return nil
+	}
+	return parseGrokModelsCLI(string(out))
+}
+
+func parseGrokModelsCLI(out string) []core.ModelOption {
+	var models []core.ModelOption
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Formats: "* grok-4.5 (default)" / "- grok-4.6"
+		if !(strings.HasPrefix(line, "* ") || strings.HasPrefix(line, "- ")) {
+			continue
+		}
+		rest := strings.TrimSpace(line[2:])
+		id := strings.Fields(rest)
+		if len(id) == 0 {
+			continue
+		}
+		name := id[0]
+		if !isGrokChatModel(name) {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		models = append(models, core.ModelOption{Name: name})
+	}
+	sort.Slice(models, func(i, j int) bool { return models[i].Name < models[j].Name })
+	return models
+}
+
+func isGrokChatModel(id string) bool {
+	id = strings.ToLower(strings.TrimSpace(id))
+	if id == "" {
+		return false
+	}
+	switch {
+	case strings.HasPrefix(id, "grok-4"),
+		strings.HasPrefix(id, "grok-composer"),
+		strings.HasPrefix(id, "grok-build"),
+		strings.HasPrefix(id, "grok-chat"):
+		return true
+	}
+	return false
+}
+
+func acpFallbackModels() []core.ModelOption {
+	return []core.ModelOption{
+		{Name: "grok-4.5"},
+		{Name: "grok-4.6"},
+		{Name: "grok-4.7"},
+		{Name: "grok-composer-2.5-fast"},
+		{Name: "grok-4.3"},
+		{Name: "grok-build-0.1"},
+		{Name: "grok-chat-fast"},
+	}
+}
+
+// injectModelArgs inserts `-m <model>` before a trailing `stdio` arg,
+// or immediately after `agent` when `stdio` is absent. Leaves args
+// unchanged when model is empty.
+func injectModelArgs(args []string, model string) []string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return append([]string(nil), args...)
+	}
+	out := make([]string, 0, len(args)+2)
+	inserted := false
+	for _, a := range args {
+		if !inserted && a == "stdio" {
+			out = append(out, "-m", model)
+			inserted = true
+		}
+		out = append(out, a)
+	}
+	if inserted {
+		return out
+	}
+	out = out[:0]
+	for _, a := range args {
+		out = append(out, a)
+		if !inserted && a == "agent" {
+			out = append(out, "-m", model)
+			inserted = true
+		}
+	}
+	if !inserted {
+		out = append(out, "-m", model)
+	}
+	return out
 }
 
 // -- ModeSwitcher --

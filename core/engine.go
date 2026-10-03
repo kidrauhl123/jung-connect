@@ -452,6 +452,7 @@ type Engine struct {
 	multiWorkspace               bool
 	baseDir                      string
 	skipGit                      bool
+	fallbackWorkDir              string // unbound channel fallback (like old work_dir)
 	workspaceInitAllowLocalPaths bool
 	workspaceBindings            *WorkspaceBindingManager
 	workspacePool                *workspacePool
@@ -1013,6 +1014,21 @@ func (e *Engine) SetWebStatusFunc(fn func() string)                    { e.webSt
 
 func (e *Engine) SetSkipGit(skipGit bool) {
 	e.skipGit = skipGit
+}
+
+// SetFallbackWorkDir sets the directory used when a channel has no workspace
+// binding in multi-workspace mode. Empty disables the fallback (init flow).
+func (e *Engine) SetFallbackWorkDir(dir string) {
+	e.fallbackWorkDir = strings.TrimSpace(dir)
+}
+
+// effectiveFallbackWorkspace returns the normalized fallback work dir, or "".
+func (e *Engine) effectiveFallbackWorkspace() string {
+	dir := strings.TrimSpace(e.fallbackWorkDir)
+	if dir == "" {
+		return ""
+	}
+	return normalizeWorkspacePath(dir)
 }
 
 // SetInjectSender controls whether sender identity (platform and user ID) is
@@ -1592,12 +1608,17 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		channelID := extractChannelID(sessionKey)
 		if channelID != "" {
 			workspace, _, err := e.resolveWorkspace(targetPlatform, channelID)
-			if err == nil && workspace != "" {
-				wsAgent, wsSessions, _, effectiveDir, err := e.workspaceContext(workspace, sessionKey)
-				if err == nil {
-					agent = wsAgent
-					sessions = wsSessions
-					workspaceDir = effectiveDir
+			if err == nil {
+				if workspace == "" {
+					workspace = e.effectiveFallbackWorkspace()
+				}
+				if workspace != "" {
+					wsAgent, wsSessions, _, effectiveDir, err := e.workspaceContext(workspace, sessionKey)
+					if err == nil {
+						agent = wsAgent
+						sessions = wsSessions
+						workspaceDir = effectiveDir
+					}
 				}
 			}
 		}
@@ -1793,12 +1814,17 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 		channelID := extractChannelID(sessionKey)
 		if channelID != "" {
 			workspace, _, err := e.resolveWorkspace(targetPlatform, channelID)
-			if err == nil && workspace != "" {
-				wsAgent, wsSessions, _, effectiveDir, err := e.workspaceContext(workspace, sessionKey)
-				if err == nil {
-					agent = wsAgent
-					sessions = wsSessions
-					workspaceDir = effectiveDir
+			if err == nil {
+				if workspace == "" {
+					workspace = e.effectiveFallbackWorkspace()
+				}
+				if workspace != "" {
+					wsAgent, wsSessions, _, effectiveDir, err := e.workspaceContext(workspace, sessionKey)
+					if err == nil {
+						agent = wsAgent
+						sessions = wsSessions
+						workspaceDir = effectiveDir
+					}
 				}
 			}
 		}
@@ -2934,7 +2960,12 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 			return
 		}
 		if workspace == "" {
-			// No workspace — handle init flow (unless it's a /workspace command)
+			// Optional fallback (like old fixed work_dir): unbound channels chat
+			// here without forcing bind/init. Binding remains optional.
+			workspace = e.effectiveFallbackWorkspace()
+		}
+		if workspace == "" {
+			// No workspace and no fallback — handle init flow (unless it's a /workspace command)
 			if !strings.HasPrefix(content, "/workspace") && !strings.HasPrefix(content, "/ws ") {
 				if e.handleWorkspaceInitFlow(p, msg, channelName) {
 					return
@@ -3977,6 +4008,14 @@ func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionMan
 		}
 	}
 
+	// Re-apply workspace model onto the active provider. CreateAgent only sets
+	// a.model from opts, but most agents prefer providers[i].Model in GetModel
+	// and StartSession — without this, WorkspaceModelOverride / copied a.model
+	// would be ignored after SetProviders above.
+	if model, ok := opts["model"].(string); ok && strings.TrimSpace(model) != "" {
+		applyRuntimeModelOnAgent(agent, strings.TrimSpace(model))
+	}
+
 	// Create per-workspace session manager
 	h := sha256.Sum256([]byte(workspace))
 	sessionFile := filepath.Join(filepath.Dir(e.sessions.StorePath()),
@@ -5017,6 +5056,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	var cardToolCalls []cardToolEntry  // track tool calls for card content
 	var cardThinkingText string        // latest thinking text
 	var cardAnswerText strings.Builder // accumulated answer text
+	var thinkingAcc strings.Builder    // accumulated thinking deltas (avoid per-word bubbles)
 
 	if scp, ok := state.platform.(StreamingCardPlatform); ok {
 		if sc, err := scp.CreateStreamingCard(e.ctx, state.replyCtx); err != nil {
@@ -5215,18 +5255,24 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if isEllipsisOnly(event.Content) {
 				break
 			}
+			thinkingAcc.WriteString(event.Content)
+			accumulatedThinking := thinkingAcc.String()
 			if hasRichCard {
 				// When thinking messages are suppressed, skip card creation.
 				if !e.display.ThinkingMessages {
 					break
 				}
-				if thinking := strings.TrimSpace(truncateIf(event.Content, e.display.ThinkingMaxLen)); thinking != "" {
-					toolSteps = append(toolSteps, ToolStep{
-						Kind:    ToolStepKindThinking,
-						Name:    "Thinking",
-						Summary: thinking,
-						Done:    true,
-					})
+				if thinking := strings.TrimSpace(truncateIf(accumulatedThinking, e.display.ThinkingMaxLen)); thinking != "" {
+					if n := len(toolSteps); n > 0 && toolSteps[n-1].Kind == ToolStepKindThinking {
+						toolSteps[n-1].Summary = thinking
+					} else {
+						toolSteps = append(toolSteps, ToolStep{
+							Kind:    ToolStepKindThinking,
+							Name:    "Thinking",
+							Summary: thinking,
+							Done:    true,
+						})
+					}
 				}
 				if cardMessageID == nil {
 					card := buildResolvedRichCard(CardStatusThinking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
@@ -5270,10 +5316,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				silentHold = false
 			}
-			if e.display.ThinkingMessages && event.Content != "" {
+			if e.display.ThinkingMessages && accumulatedThinking != "" {
 				// --- StreamingCard path ---
 				if streamCard != nil && !streamCard.Failed() {
-					cardThinkingText = truncateIf(event.Content, e.display.ThinkingMaxLen)
+					cardThinkingText = truncateIf(accumulatedThinking, e.display.ThinkingMaxLen)
 					_ = streamCard.Update(e.ctx, buildCardContent(cardThinkingText, cardToolCalls, cardAnswerText.String()))
 					continue // skip original independent message sending
 				}
@@ -5296,7 +5342,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if previewActive {
 					sp.detachPreview() // keep frozen preview visible as permanent message
 				}
-				preview := truncateIf(event.Content, e.display.ThinkingMaxLen)
+				preview := truncateIf(accumulatedThinking, e.display.ThinkingMaxLen)
 				thinkingMsg := fmt.Sprintf(e.i18n.T(MsgThinking), preview)
 				if !cp.AppendEvent(ProgressEntryThinking, preview, "", thinkingMsg) {
 					sendWorkspace(p, replyCtx, thinkingMsg)
@@ -5304,6 +5350,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 		case EventToolUse:
+			thinkingAcc.Reset()
 			toolCount++
 			if hasRichCard {
 				// When tool messages are suppressed, skip card updates on tool events.
@@ -5481,6 +5528,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 		case EventText:
+			thinkingAcc.Reset()
 			content := event.Content
 			if e.display.HideAgentFooter {
 				content = stripAgentFooterLines(content)
@@ -5726,6 +5774,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				)
 				continue
 			}
+			thinkingAcc.Reset()
 			cp.Finalize(ProgressCardStateCompleted)
 			// Use state.agentSession.CurrentSessionID() instead of event.SessionID.
 			// event.SessionID may be empty in some cases, causing the agent_session_id
@@ -6196,6 +6245,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				cardToolCalls = nil
 				cardThinkingText = ""
 				cardAnswerText.Reset()
+				thinkingAcc.Reset()
 
 				// Try to create a new streaming card for the queued turn
 				if scp, ok := queued.platform.(StreamingCardPlatform); ok {
@@ -9789,63 +9839,26 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 		return
 	}
 
-	if len(args) == 0 {
+	// Two-level vendor menu: `/model vendor <key>` shows models in that vendor.
+	if len(args) >= 1 && strings.EqualFold(strings.TrimSpace(args[0]), "vendor") {
+		vendorKey := ""
+		if len(args) >= 2 {
+			vendorKey = strings.TrimSpace(args[1])
+		}
 		if !supportsCards(p) {
-			fetchCtx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
-			defer cancel()
-			models := switcher.AvailableModels(fetchCtx)
-
-			var sb strings.Builder
-			current := switcher.GetModel()
-			if current == "" {
-				sb.WriteString(e.i18n.T(MsgModelDefault))
-			} else {
-				sb.WriteString(e.i18n.Tf(MsgModelCurrent, current))
-				sb.WriteString("\n")
-			}
-			sb.WriteString("\n")
-			sb.WriteString(e.i18n.T(MsgModelListTitle))
-			var buttons [][]ButtonOption
-			var row []ButtonOption
-			for i, m := range models {
-				marker := "  "
-				if m.Name == current {
-					marker = "> "
-				}
-				var line string
-				if m.Alias != "" {
-					line = fmt.Sprintf("%s%d. %s - %s\n", marker, i+1, m.Alias, m.Name)
-				} else {
-					desc := m.Desc
-					if desc != "" {
-						desc = " — " + desc
-					}
-					line = fmt.Sprintf("%s%d. %s%s\n", marker, i+1, m.Name, desc)
-				}
-				sb.WriteString(line)
-
-				label := m.Name
-				if m.Alias != "" {
-					label = m.Alias
-				}
-				if m.Name == current {
-					label = "▶ " + label
-				}
-				row = append(row, ButtonOption{Text: label, Data: fmt.Sprintf("cmd:/model switch %d", i+1)})
-				if len(row) >= 3 {
-					buttons = append(buttons, row)
-					row = nil
-				}
-			}
-			if len(row) > 0 {
-				buttons = append(buttons, row)
-			}
-			sb.WriteString("\n")
-			sb.WriteString(e.i18n.T(MsgModelUsage))
-			e.replyWithButtons(p, msg.ReplyCtx, sb.String(), buttons)
+			e.replyModelVendorButtons(p, msg, switcher, vendorKey)
 			return
 		}
-		e.replyWithCard(p, msg.ReplyCtx, e.renderModelCard(msg.SessionKey))
+		e.replyWithCard(p, msg.ReplyCtx, e.renderModelCard(msg.SessionKey, vendorKey))
+		return
+	}
+
+	if len(args) == 0 {
+		if !supportsCards(p) {
+			e.replyModelVendorButtons(p, msg, switcher, "")
+			return
+		}
+		e.replyWithCard(p, msg.ReplyCtx, e.renderModelCard(msg.SessionKey, ""))
 		return
 	}
 
@@ -9863,7 +9876,7 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 		target = resolveModelSwitchTarget(target, models)
 	}
 
-	target, err = e.switchModelOnAgent(agent, target, agent == e.agent)
+	target, err = e.switchModelOnAgent(agent, target, e.shouldPersistModelConfig(agent))
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgModelChangeFailed, err))
 		return
@@ -9877,6 +9890,102 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 	sessions.Save()
 
 	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgModelChanged, target))
+}
+
+// replyModelVendorButtons renders the Telegram (button) two-level /model menu.
+// vendorKey empty → vendor list; otherwise models in that vendor + Back.
+func (e *Engine) replyModelVendorButtons(p Platform, msg *Message, switcher ModelSwitcher, vendorKey string) {
+	fetchCtx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
+	defer cancel()
+	models := switcher.AvailableModels(fetchCtx)
+	current := switcher.GetModel()
+
+	var sb strings.Builder
+	if current == "" {
+		sb.WriteString(e.i18n.T(MsgModelDefault))
+	} else {
+		sb.WriteString(e.i18n.Tf(MsgModelCurrent, current))
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\n")
+
+	groups := GroupModelsByVendor(models)
+	var buttons [][]ButtonOption
+
+	if vendorKey == "" || !IsModelVendorKey(vendorKey) {
+		sb.WriteString(e.i18n.T(MsgModelVendorListTitle))
+		sb.WriteString("\n")
+		var row []ButtonOption
+		for _, g := range groups {
+			label := fmt.Sprintf("%s (%d)", g.Label, len(g.Indices))
+			// Mark vendor containing the current model.
+			for _, idx := range g.Indices {
+				if models[idx].Name == current {
+					label = "▶ " + label
+					break
+				}
+			}
+			row = append(row, ButtonOption{Text: label, Data: "cmd:/model vendor " + g.Key})
+			if len(row) >= 2 {
+				buttons = append(buttons, row)
+				row = nil
+			}
+		}
+		if len(row) > 0 {
+			buttons = append(buttons, row)
+		}
+		sb.WriteString("\n")
+		sb.WriteString(e.i18n.T(MsgModelUsage))
+		e.replyWithButtons(p, msg.ReplyCtx, sb.String(), buttons)
+		return
+	}
+
+	var group *ModelVendorGroup
+	for i := range groups {
+		if groups[i].Key == vendorKey {
+			group = &groups[i]
+			break
+		}
+	}
+	if group == nil {
+		// Empty / unknown vendor → fall back to vendor list.
+		e.replyModelVendorButtons(p, msg, switcher, "")
+		return
+	}
+
+	sb.WriteString(fmt.Sprintf("%s\n\n", group.Label))
+	sb.WriteString(e.i18n.T(MsgModelListTitle))
+	var row []ButtonOption
+	for _, i := range group.Indices {
+		m := models[i]
+		marker := "  "
+		if m.Name == current {
+			marker = "> "
+		}
+		desc := m.Desc
+		if desc != "" {
+			desc = " — " + desc
+		}
+		sb.WriteString(fmt.Sprintf("%s%d. %s%s\n", marker, i+1, m.Name, desc))
+
+		// Prefer live model id/name on picker buttons; Alias remains for typed /model only.
+		label := m.Name
+		if m.Name == current {
+			label = "▶ " + label
+		}
+		row = append(row, ButtonOption{Text: label, Data: fmt.Sprintf("cmd:/model switch %d", i+1)})
+		if len(row) >= 2 {
+			buttons = append(buttons, row)
+			row = nil
+		}
+	}
+	if len(row) > 0 {
+		buttons = append(buttons, row)
+	}
+	buttons = append(buttons, []ButtonOption{{Text: e.i18n.T(MsgModelVendorBack), Data: "cmd:/model"}})
+	sb.WriteString("\n")
+	sb.WriteString(e.i18n.T(MsgModelUsage))
+	e.replyWithButtons(p, msg.ReplyCtx, sb.String(), buttons)
 }
 
 // resolveModelAlias resolves a user-supplied string to a model name.
@@ -9934,15 +10043,53 @@ func parseModelSwitchArgs(args []string) (string, bool) {
 	return "", false
 }
 
-// switchModel applies a runtime model selection to the global engine agent and
-// persists the change so reloads keep the selected default.
+// switchModel applies a runtime model selection to the global engine agent.
+// In multi-workspace mode the project-wide toml default is left unchanged.
 func (e *Engine) switchModel(target string) (string, error) {
-	return e.switchModelOnAgent(e.agent, target, true)
+	return e.switchModelOnAgent(e.agent, target, e.shouldPersistModelConfig(e.agent))
+}
+
+
+// applyRuntimeModelOnAgent updates an agent's in-memory model and active
+// provider model without touching project config. Used when creating
+// workspace agents so opts["model"] / WorkspaceModelOverride survive
+// provider wiring (which copies the global provider.Model).
+func applyRuntimeModelOnAgent(agent Agent, model string) {
+	if model == "" || agent == nil {
+		return
+	}
+	if switcher, ok := agent.(ModelSwitcher); ok {
+		switcher.SetModel(model)
+	}
+	ps, ok := agent.(ProviderSwitcher)
+	if !ok {
+		return
+	}
+	active := ps.GetActiveProvider()
+	if active == nil || active.Name == "" {
+		return
+	}
+	updated, found := SetProviderModel(ps.ListProviders(), active.Name, model)
+	if !found {
+		return
+	}
+	ps.SetProviders(updated)
+	ps.SetActiveProvider(active.Name)
+}
+
+// shouldPersistModelConfig reports whether a /model switch may write the
+// project-wide provider/model default into claude.toml. Multi-workspace
+// projects always keep model selection per workspace (WorkspaceModelOverrides)
+// and must not mutate the shared project default.
+func (e *Engine) shouldPersistModelConfig(agent Agent) bool {
+	return !e.multiWorkspace && agent == e.agent
 }
 
 // switchModelOnAgent applies a runtime model selection to the provided agent.
 // When persistConfig is true, config-backed model/provider changes are saved so
-// reloads keep the new default. Workspace-scoped runtime switches pass false.
+// reloads keep the new default. Workspace-scoped runtime switches pass false
+// but still update the agent's in-memory provider model so GetModel/StartSession
+// (which prefer provider.Model over a.model) take effect immediately.
 func (e *Engine) switchModelOnAgent(agent Agent, target string, persistConfig bool) (string, error) {
 	switcher, ok := agent.(ModelSwitcher)
 	if !ok {
@@ -9976,15 +10123,13 @@ func (e *Engine) switchModelOnAgent(agent Agent, target string, persistConfig bo
 		switcher.SetModel(target)
 		return target, nil
 	}
-	if !persistConfig {
-		switcher.SetModel(target)
-		return target, nil
-	}
 	if persistConfig && e.providerModelSaveFunc != nil {
 		if err := e.providerModelSaveFunc(active.Name, target); err != nil {
 			return "", fmt.Errorf("save provider model %q: %w", active.Name, err)
 		}
 	}
+	// Always update in-memory provider model so runtime GetModel/StartSession
+	// see the new selection (agents prefer providers[i].Model over a.model).
 	providerSwitcher.SetProviders(updated)
 	switcher.SetModel(target)
 	providerSwitcher.SetActiveProvider(active.Name)
@@ -10293,35 +10438,12 @@ func (e *Engine) cmdStop(p Platform, msg *Message) {
 	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgExecutionStopped))
 }
 
-// cmdCancel stops the current execution and starts a fresh session.
-// Unlike /stop which only halts execution, /cancel also resets the session
-// so the user can immediately continue with new instructions.
+// cmdCancel stops the current execution and keeps the conversation.
+// It used to also wipe history and open a new session, so the next message
+// arrived with no context. /stop and /cancel now do the same thing: halt the
+// live turn, leave the session id in place, and let the next message resume it.
 func (e *Engine) cmdCancel(p Platform, msg *Message) {
-	_, sessions, interactiveKey, err := e.commandContext(p, msg)
-	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
-		return
-	}
-
-	slog.Info("cmdCancel: stopping execution and creating new session", "session_key", msg.SessionKey)
-
-	// Stop the current execution (like /stop)
-	stopped := e.stopInteractiveSession(interactiveKey, p, msg.ReplyCtx)
-	if !stopped {
-		// No execution in progress, but still create a new session
-		slog.Debug("cmdCancel: no execution to stop, proceeding with new session", "session_key", msg.SessionKey)
-	}
-
-	// Clear old session's agent session ID so it cannot be resumed
-	old := sessions.GetOrCreateActive(msg.SessionKey)
-	old.SetAgentSessionID("", "")
-	old.ClearHistory()
-	sessions.Save()
-
-	// Create a new session (like /new)
-	sessions.NewSession(msg.SessionKey, "")
-
-	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSessionCancelled))
+	e.cmdStop(p, msg)
 }
 
 func (e *Engine) stopInteractiveSession(sessionKey string, quietPlatform Platform, quietReplyCtx any) bool {
@@ -12159,7 +12281,11 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 	case "/help":
 		return e.renderHelpGroupCard(args)
 	case "/model":
-		return e.renderModelCard(sessionKey)
+		vendorKey := ""
+		if fields := strings.Fields(args); len(fields) >= 2 && strings.EqualFold(fields[0], "vendor") {
+			vendorKey = fields[1]
+		}
+		return e.renderModelCard(sessionKey, vendorKey)
 	case "/reasoning":
 		return e.renderReasoningCard()
 	case "/mode":
@@ -12240,9 +12366,18 @@ func (e *Engine) handleModelCardAction(args, sessionKey string) *Card {
 		return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", e.i18n.T(MsgModelNotSupported))
 	}
 
-	target, ok := parseModelSwitchArgs(strings.Fields(args))
+	fields := strings.Fields(args)
+	if len(fields) >= 1 && strings.EqualFold(fields[0], "vendor") {
+		vendorKey := ""
+		if len(fields) >= 2 {
+			vendorKey = fields[1]
+		}
+		return e.renderModelCard(sessionKey, vendorKey)
+	}
+
+	target, ok := parseModelSwitchArgs(fields)
 	if !ok {
-		return e.renderModelCard(sessionKey)
+		return e.renderModelCard(sessionKey, "")
 	}
 	target = strings.TrimSpace(target)
 	if modelSwitchNeedsLookup(target) {
@@ -12252,7 +12387,7 @@ func (e *Engine) handleModelCardAction(args, sessionKey string) *Card {
 		cancel()
 	}
 
-	resolved, err := e.switchModelOnAgent(agent, target, agent == e.agent)
+	resolved, err := e.switchModelOnAgent(agent, target, e.shouldPersistModelConfig(agent))
 	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 	if err == nil {
 		e.persistWorkspaceModelOverride(interactiveKey, sessionKey, agent, resolved)
@@ -12269,10 +12404,10 @@ func (e *Engine) persistWorkspaceModelOverride(interactiveKey, sessionKey string
 	if e.projectState == nil || !e.multiWorkspace || model == "" {
 		return
 	}
-	if agent == e.agent {
-		return
-	}
 	workspace := workspaceModelOverrideKey(interactiveKey, sessionKey, agent)
+	if workspace == "" {
+		workspace = e.effectiveFallbackWorkspace()
+	}
 	if workspace == "" {
 		return
 	}
@@ -12864,7 +12999,7 @@ func (e *Engine) pushDeleteModeResultCard(sessionKey string) {
 }
 
 func (e *Engine) performModelSwitchAsync(sessionKey string, state *interactiveState, agent Agent, sessions *SessionManager, target string) {
-	resolved, err := e.switchModelOnAgent(agent, target, agent == e.agent)
+	resolved, err := e.switchModelOnAgent(agent, target, e.shouldPersistModelConfig(agent))
 	if err == nil {
 		interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 		e.persistWorkspaceModelOverride(interactiveKey, sessionKey, agent, resolved)
@@ -13089,7 +13224,7 @@ func (e *Engine) renderLangCard() *Card {
 		Build()
 }
 
-func (e *Engine) renderModelCard(sessionKey string) *Card {
+func (e *Engine) renderModelCard(sessionKey string, vendorKey string) *Card {
 	if ms := e.getModelSwitchState(sessionKey); ms != nil && ms.phase == "switching" {
 		return e.renderModelSwitchingCard(ms.target)
 	}
@@ -13108,6 +13243,7 @@ func (e *Engine) renderModelCard(sessionKey string) *Card {
 	defer cancel()
 	models := switcher.AvailableModels(fetchCtx)
 	current := switcher.GetModel()
+	groups := GroupModelsByVendor(models)
 
 	var sb strings.Builder
 	if current == "" {
@@ -13116,13 +13252,71 @@ func (e *Engine) renderModelCard(sessionKey string) *Card {
 		sb.WriteString(e.i18n.Tf(MsgModelCurrent, current))
 	}
 
+	// Level 1: vendor list
+	if vendorKey == "" || !IsModelVendorKey(vendorKey) {
+		var opts []CardSelectOption
+		initVal := ""
+		for _, g := range groups {
+			label := fmt.Sprintf("%s (%d)", g.Label, len(g.Indices))
+			val := "act:/model vendor " + g.Key
+			for _, idx := range g.Indices {
+				if models[idx].Name == current {
+					label = "▶ " + label
+					initVal = val
+					break
+				}
+			}
+			opts = append(opts, CardSelectOption{Text: label, Value: val})
+		}
+		// Also expose as equal buttons for platforms that prefer buttons over select.
+		cb := NewCard().Title(e.i18n.T(MsgCardTitleModel), "indigo").
+			Markdown(sb.String()).
+			Select(e.i18n.T(MsgModelVendorSelectPlaceholder), opts, initVal)
+		var row []CardButton
+		for _, g := range groups {
+			label := g.Label
+			for _, idx := range g.Indices {
+				if models[idx].Name == current {
+					label = "▶ " + label
+					break
+				}
+			}
+			row = append(row, DefaultBtn(label, "nav:/model vendor "+g.Key))
+			if len(row) >= 2 {
+				cb.ButtonsEqual(row...)
+				row = nil
+			}
+		}
+		if len(row) > 0 {
+			cb.ButtonsEqual(row...)
+		}
+		cb.Buttons(e.cardBackButton())
+		cb.Note(e.i18n.T(MsgModelUsage))
+		return cb.Build()
+	}
+
+	// Level 2: models in vendor
+	var group *ModelVendorGroup
+	for i := range groups {
+		if groups[i].Key == vendorKey {
+			group = &groups[i]
+			break
+		}
+	}
+	if group == nil {
+		return e.renderModelCard(sessionKey, "")
+	}
+
+	sb.WriteString("\n\n**")
+	sb.WriteString(group.Label)
+	sb.WriteString("**")
+
 	var opts []CardSelectOption
 	initVal := ""
-	for i, m := range models {
+	for _, i := range group.Indices {
+		m := models[i]
 		label := m.Name
-		if m.Alias != "" {
-			label = m.Alias + " - " + m.Name
-		} else if m.Desc != "" {
+		if m.Desc != "" {
 			label += " — " + m.Desc
 		}
 		val := fmt.Sprintf("act:/model switch %d", i+1)
@@ -13135,7 +13329,7 @@ func (e *Engine) renderModelCard(sessionKey string) *Card {
 	cb := NewCard().Title(e.i18n.T(MsgCardTitleModel), "indigo").
 		Markdown(sb.String()).
 		Select(e.i18n.T(MsgModelSelectPlaceholder), opts, initVal).
-		Buttons(e.cardBackButton())
+		Buttons(DefaultBtn(e.i18n.T(MsgModelVendorBack), "nav:/model"), e.cardBackButton())
 	cb.Note(e.i18n.T(MsgModelUsage))
 	return cb.Build()
 }
@@ -15940,6 +16134,9 @@ func (e *Engine) relayContextForSourceSessionKey(fromProject, sourceSessionKey s
 		return nil, nil, "", fmt.Errorf("resolve relay workspace: %w", err)
 	}
 	if workspace == "" {
+		workspace = e.effectiveFallbackWorkspace()
+	}
+	if workspace == "" {
 		if b, _, usable := e.lookupEffectiveWorkspaceBinding(channelKey); b != nil && !usable {
 			return nil, nil, "", fmt.Errorf("workspace binding unavailable for source channel %q", channelKey)
 		}
@@ -16508,6 +16705,9 @@ func (e *Engine) commandContextWithWorkspace(p Platform, msg *Message) (Agent, *
 		return nil, nil, "", "", err
 	}
 	if workspace == "" {
+		workspace = e.effectiveFallbackWorkspace()
+	}
+	if workspace == "" {
 		return e.agent, e.sessions, msg.SessionKey, "", nil
 	}
 	agent, sessions, interactiveKey, effectiveDir, err := e.workspaceContext(workspace, msg.SessionKey)
@@ -16544,6 +16744,13 @@ func (e *Engine) sessionContextForKey(sessionKey string) (Agent, *SessionManager
 	// to the same agent session.
 	if workspace := e.workspaceFromLiveState(sessionKey); workspace != "" {
 		if wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(workspace); err == nil {
+			return wsAgent, wsSessions
+		}
+	}
+	// Unbound channel with fallback_work_dir: use the per-workspace agent for
+	// the fallback dir (same as commandContext), never the global e.agent.
+	if fb := e.effectiveFallbackWorkspace(); fb != "" {
+		if wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(fb); err == nil {
 			return wsAgent, wsSessions
 		}
 	}
@@ -16672,6 +16879,9 @@ func (e *Engine) interactiveKeyForSessionKeyLocked(sessionKey string) string {
 	}
 	if found := findInteractiveKeyInStatesLocked(e.interactiveStates, sessionKey); found != "" {
 		return found
+	}
+	if fb := e.effectiveFallbackWorkspace(); fb != "" {
+		return fb + ":" + sessionKey
 	}
 	return sessionKey
 }
@@ -16834,6 +17044,13 @@ func (e *Engine) handleWorkspaceInitFlow(p Platform, msg *Message, channelName s
 			return false
 		}
 		if e.skipGit {
+			// Empty channel name (e.g. unnamed Telegram topic) cannot form a
+			// sensible mkdir target — skip the broken "I'll mkdir ``" prompt.
+			// Callers with fallback_work_dir never reach here; without a
+			// fallback, only slash commands (e.g. /workspace bind) proceed.
+			if strings.TrimSpace(channelName) == "" {
+				return false
+			}
 			cloneTo := filepath.Join(e.baseDir, channelName)
 			flow = &workspaceInitFlow{
 				state:       "awaiting_confirm",

@@ -696,6 +696,7 @@ level = "info" # debug, info, warn, error
 # mode = "multi-workspace"
 # skip_git = true # skip bind git repo, create a dir directly
 # base_dir = "~/workspace"
+# fallback_work_dir = "/home/box"  # Optional: unbound channels/topics chat here (no forced bind/init); bind still optional
 # workspace_init_allow_local_paths = true  # Optional: allow /workspace init <local-dir>; default false keeps init git-URL only
 #
 # [projects.agent]

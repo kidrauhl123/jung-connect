@@ -141,9 +141,10 @@ type GlobalProviderInfo struct {
 	Thinking   string            `json:"thinking,omitempty"`
 	Env        map[string]string `json:"env,omitempty"`
 	AgentTypes []string          `json:"agent_types,omitempty"`
-	Models     []struct {
+	Models []struct {
 		Model string `json:"model"`
 		Alias string `json:"alias,omitempty"`
+		Group string `json:"group,omitempty"`
 	} `json:"models,omitempty"`
 	Endpoints       map[string]string              `json:"endpoints,omitempty"`
 	AgentModels     map[string]string              `json:"agent_models,omitempty"`
@@ -155,6 +156,7 @@ type GlobalProviderInfo struct {
 type GlobalModelEntry struct {
 	Model string `json:"model"`
 	Alias string `json:"alias,omitempty"`
+	Group string `json:"group,omitempty"`
 }
 
 // GlobalCodexConfig holds Codex-specific provider settings for the management API.
@@ -1956,12 +1958,12 @@ func resolveGlobalProviderForAgent(g GlobalProviderInfo, agentType string) Provi
 	if aml, ok := g.AgentModelLists[agentType]; ok && len(aml) > 0 {
 		pc.Models = make([]ModelOption, len(aml))
 		for i, m := range aml {
-			pc.Models[i] = ModelOption{Name: m.Model, Alias: m.Alias}
+			pc.Models[i] = ModelOption{Name: m.Model, Alias: m.Alias, Group: m.Group}
 		}
 	} else if len(g.Models) > 0 {
 		pc.Models = make([]ModelOption, len(g.Models))
 		for i, m := range g.Models {
-			pc.Models[i] = ModelOption{Name: m.Model, Alias: m.Alias}
+			pc.Models[i] = ModelOption{Name: m.Model, Alias: m.Alias, Group: m.Group}
 		}
 	}
 	return pc

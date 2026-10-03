@@ -133,11 +133,13 @@ func (a *Agent) configuredModels() []core.ModelOption {
 }
 
 func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
-	if models := a.configuredModels(); len(models) > 0 {
-		return models
-	}
+	configured := a.configuredModels()
+	// Prefer New API /v1/models (provider base_url+key or env); toml entries stay as aliases.
 	if models := a.fetchModelsFromAPI(ctx); len(models) > 0 {
-		return models
+		return core.MergeModelAliases(models, configured)
+	}
+	if len(configured) > 0 {
+		return configured
 	}
 	return []core.ModelOption{
 		{Name: "gemini-3.1-pro-preview", Desc: "Gemini 3.1 Pro Preview"},
@@ -148,15 +150,32 @@ func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
 }
 
 func (a *Agent) fetchModelsFromAPI(ctx context.Context) []core.ModelOption {
-	apiKey := os.Getenv("GEMINI_API_KEY")
-	if apiKey == "" {
-		apiKey = os.Getenv("GOOGLE_API_KEY")
+	a.mu.RLock()
+	apiKey := ""
+	baseURL := ""
+	if a.activeIdx >= 0 && a.activeIdx < len(a.providers) {
+		apiKey = a.providers[a.activeIdx].APIKey
+		baseURL = a.providers[a.activeIdx].BaseURL
 	}
-	if apiKey == "" {
+	a.mu.RUnlock()
+
+	baseURL, apiKey = core.ResolveModelsAPICreds(baseURL, apiKey)
+	if apiKey != "" && baseURL != "" {
+		if models := core.FetchOpenAICompatibleModels(ctx, baseURL, apiKey); len(models) > 0 {
+			return models
+		}
+	}
+
+	// Legacy fallback: Google Generative Language API (agy native path).
+	gkey := os.Getenv("GEMINI_API_KEY")
+	if gkey == "" {
+		gkey = os.Getenv("GOOGLE_API_KEY")
+	}
+	if gkey == "" {
 		return nil
 	}
 
-	url := "https://generativelanguage.googleapis.com/v1beta/models?key=" + apiKey
+	url := "https://generativelanguage.googleapis.com/v1beta/models?key=" + gkey
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil
@@ -210,9 +229,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	extraArgs := append([]string{}, a.cliExtraArgs...)
 	workDir := a.workDir
 	timeout := a.timeout
-	extraEnv := append([]string(nil), a.configEnv...)
-	extraEnv = append(extraEnv, a.providerEnvLocked()...)
-	extraEnv = append(extraEnv, a.sessionEnv...)
+	// Provider env first, then config env so [projects.agent.options.env]
+	// can pin GOOGLE_GEMINI_BASE_URL to the local rewrite proxy without
+	// being overwritten by the provider OpenAI /v1 base URL.
+	extraEnv := mergeSessionExtraEnv(a.configEnv, a.providerEnvLocked(), a.sessionEnv)
 	if a.activeIdx >= 0 && a.activeIdx < len(a.providers) {
 		if m := a.providers[a.activeIdx].Model; m != "" {
 			model = m
@@ -228,44 +248,50 @@ func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error)
 }
 
 func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("antigravity: cannot determine home dir: %w", err)
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || strings.Contains(sessionID, "/") || strings.Contains(sessionID, "\\") || sessionID == "." || sessionID == ".." {
+		return fmt.Errorf("invalid session ID: %s", sessionID)
 	}
-	chatsDir := filepath.Join(homeDir, ".gemini", "tmp", antigravityProjectSlug(a.workDir), "chats")
-	entries, err := os.ReadDir(chatsDir)
+
+	dataDir, err := antigravityDataDir()
 	if err != nil {
+		return fmt.Errorf("antigravity: cannot determine data dir: %w", err)
+	}
+
+	found := false
+
+	// 1. Remove brain/<sessionID>
+	brainPath := filepath.Join(dataDir, "brain", sessionID)
+	if _, err := os.Stat(brainPath); err == nil {
+		if err := os.RemoveAll(brainPath); err == nil {
+			found = true
+		}
+	}
+
+	// 2. Remove conversations/<sessionID>.db*
+	convPattern := filepath.Join(dataDir, "conversations", sessionID+".db*")
+	if matches, err := filepath.Glob(convPattern); err == nil {
+		for _, m := range matches {
+			if err := os.Remove(m); err == nil {
+				found = true
+			}
+		}
+	}
+
+	// 3. Remove annotations/<sessionID>.pbtxt
+	annotPath := filepath.Join(dataDir, "annotations", sessionID+".pbtxt")
+	if _, err := os.Stat(annotPath); err == nil {
+		if err := os.Remove(annotPath); err == nil {
+			found = true
+		}
+	}
+
+	if !found {
 		return fmt.Errorf("session file not found: %s", sessionID)
 	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
-			continue
-		}
-		fpath := filepath.Join(chatsDir, entry.Name())
-		file, err := os.Open(fpath)
-		if err != nil {
-			continue
-		}
-
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-		if scanner.Scan() {
-			var sf struct {
-				SessionID string `json:"sessionId"`
-			}
-			if json.Unmarshal([]byte(scanner.Text()), &sf) == nil && sf.SessionID == sessionID {
-				_ = file.Close()
-				return os.Remove(fpath)
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			_ = file.Close()
-			continue
-		}
-		_ = file.Close()
-	}
-	return fmt.Errorf("session file not found: %s", sessionID)
+	return nil
 }
+
 
 func (a *Agent) Stop() error { return nil }
 
@@ -374,6 +400,10 @@ func (a *Agent) ListProviders() []core.ProviderConfig {
 	return result
 }
 
+func mergeSessionExtraEnv(configEnv, providerEnv, sessionEnv []string) []string {
+	return core.MergeEnv(core.MergeEnv(providerEnv, configEnv), sessionEnv)
+}
+
 func (a *Agent) providerEnvLocked() []string {
 	if a.activeIdx < 0 || a.activeIdx >= len(a.providers) {
 		return nil
@@ -382,6 +412,16 @@ func (a *Agent) providerEnvLocked() []string {
 	var env []string
 	if p.APIKey != "" {
 		env = append(env, "GEMINI_API_KEY="+p.APIKey)
+	}
+	if base := strings.TrimSpace(p.BaseURL); base != "" {
+		// agy Gemini-API mode talks to GOOGLE_GEMINI_BASE_URL + /v1beta/...
+		// New API OpenAI-compatible URLs end in /v1; strip that suffix.
+		geminiBase := strings.TrimRight(base, "/")
+		geminiBase = strings.TrimSuffix(geminiBase, "/v1")
+		geminiBase = strings.TrimSuffix(geminiBase, "/v1beta")
+		if geminiBase != "" {
+			env = append(env, "GOOGLE_GEMINI_BASE_URL="+geminiBase)
+		}
 	}
 	for k, v := range p.Env {
 		env = append(env, k+"="+v)
@@ -437,124 +477,124 @@ func slugify(s string) string {
 	return result
 }
 
-type sessionFile struct {
-	SessionID   string    `json:"sessionId"`
-	ProjectHash string    `json:"projectHash"`
-	StartTime   time.Time `json:"startTime"`
-	LastUpdated time.Time `json:"lastUpdated"`
-	Kind        string    `json:"kind"`
+func parsePbtxtTitle(data []byte) string {
+	s := string(data)
+	const prefix = `title:"`
+	idx := strings.Index(s, prefix)
+	if idx == -1 {
+		return ""
+	}
+	rest := s[idx+len(prefix):]
+	end := strings.Index(rest, `"`)
+	if end == -1 {
+		return ""
+	}
+	return rest[:end]
 }
 
-type sessionMessagePart struct {
-	Text string `json:"text"`
+func cleanPromptSummary(content string) string {
+	if start := strings.Index(content, "<USER_REQUEST>"); start != -1 {
+		content = content[start+len("<USER_REQUEST>"):]
+		if end := strings.Index(content, "</USER_REQUEST>"); end != -1 {
+			content = content[:end]
+		}
+	}
+	for _, chunk := range strings.Split(content, "\n") {
+		chunk = strings.TrimSpace(chunk)
+		if chunk != "" && !strings.HasPrefix(chunk, "<") {
+			return chunk
+		}
+	}
+	return ""
 }
 
-type sessionLine struct {
-	Type    string               `json:"type"` // "user", "assistant"
-	Content []sessionMessagePart `json:"content"`
-	Set     *struct {
-		LastUpdated time.Time `json:"lastUpdated"`
-	} `json:"$set"`
-}
-
-func listAntigravitySessions(workDir string) ([]core.AgentSessionInfo, error) {
-	homeDir, err := os.UserHomeDir()
+func listAntigravitySessions(_ string) ([]core.AgentSessionInfo, error) {
+	dataDir, err := antigravityDataDir()
 	if err != nil {
-		return nil, fmt.Errorf("antigravity: cannot determine home dir: %w", err)
+		return nil, fmt.Errorf("antigravity: cannot determine data dir: %w", err)
 	}
 
-	slug := antigravityProjectSlug(workDir)
-	chatsDir := filepath.Join(homeDir, ".gemini", "tmp", slug, "chats")
-
-	entries, err := os.ReadDir(chatsDir)
+	brainDir := filepath.Join(dataDir, "brain")
+	entries, err := os.ReadDir(brainDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("antigravity: read chats dir: %w", err)
+		return nil, fmt.Errorf("antigravity: read brain dir: %w", err)
 	}
 
 	var sessions []core.AgentSessionInfo
+	annotDir := filepath.Join(dataDir, "annotations")
+	convDir := filepath.Join(dataDir, "conversations")
+
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
 
-		fpath := filepath.Join(chatsDir, entry.Name())
-		file, err := os.Open(fpath)
-		if err != nil {
-			continue
-		}
-
-		var sf sessionFile
+		sessionID := entry.Name()
 		var summary string
+		var modTime time.Time
+
+		// Check directory mod time as initial fallback
+		if info, err := entry.Info(); err == nil {
+			modTime = info.ModTime()
+		}
+
+		// Try to read summary from annotations/<sessionID>.pbtxt
+		annotPath := filepath.Join(annotDir, sessionID+".pbtxt")
+		if data, err := os.ReadFile(annotPath); err == nil {
+			summary = parsePbtxtTitle(data)
+			if aInfo, err := os.Stat(annotPath); err == nil && aInfo.ModTime().After(modTime) {
+				modTime = aInfo.ModTime()
+			}
+		}
+
+		// Check db file mod time
+		dbPath := filepath.Join(convDir, sessionID+".db")
+		if dbInfo, err := os.Stat(dbPath); err == nil && dbInfo.ModTime().After(modTime) {
+			modTime = dbInfo.ModTime()
+		}
+
+		// Parse transcript.jsonl for message count and fallback summary
+		transcriptPath := filepath.Join(brainDir, sessionID, ".system_generated", "logs", "transcript.jsonl")
 		msgCount := 0
-		hasUserMsg := false
-
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-		lineNum := 0
-		for scanner.Scan() {
-			line := scanner.Text()
-			if line == "" {
-				continue
+		if file, err := os.Open(transcriptPath); err == nil {
+			if tInfo, err := file.Stat(); err == nil && tInfo.ModTime().After(modTime) {
+				modTime = tInfo.ModTime()
 			}
-
-			if lineNum == 0 {
-				if err := json.Unmarshal([]byte(line), &sf); err != nil || sf.SessionID == "" {
-					break
+			scanner := bufio.NewScanner(file)
+			scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+			for scanner.Scan() {
+				line := scanner.Bytes()
+				if len(line) == 0 {
+					continue
 				}
-				lineNum++
-				continue
-			}
-
-			var sl sessionLine
-			if json.Unmarshal([]byte(line), &sl) == nil {
-				if sl.Set != nil && !sl.Set.LastUpdated.IsZero() {
-					sf.LastUpdated = sl.Set.LastUpdated
-				} else if sl.Type != "" {
-					msgCount++
-					if sl.Type == "user" {
-						hasUserMsg = true
-						if summary == "" && len(sl.Content) > 0 {
-							text := strings.TrimSpace(sl.Content[0].Text)
-							for _, chunk := range strings.Split(text, "\n") {
-								chunk = strings.TrimSpace(chunk)
-								if chunk != "" {
-									summary = chunk
-									break
-								}
-							}
-						}
+				var item struct {
+					Type    string `json:"type"`
+					Content string `json:"content"`
+				}
+				if json.Unmarshal(line, &item) == nil {
+					if item.Type == "USER_INPUT" || item.Type == "PLANNER_RESPONSE" {
+						msgCount++
+					}
+					if summary == "" && item.Type == "USER_INPUT" && item.Content != "" {
+						summary = cleanPromptSummary(item.Content)
 					}
 				}
 			}
-			lineNum++
-		}
-		if err := scanner.Err(); err != nil {
 			_ = file.Close()
-			continue
-		}
-		_ = file.Close()
-
-		if sf.SessionID == "" || sf.Kind == "subagent" || !hasUserMsg {
-			continue
 		}
 
 		if summary == "" {
-			summary = sf.SessionID
+			summary = sessionID
 		}
 		if utf8.RuneCountInString(summary) > 60 {
 			summary = string([]rune(summary)[:60]) + "..."
 		}
 
-		modTime := sf.LastUpdated
-		if modTime.IsZero() {
-			modTime = sf.StartTime
-		}
-
 		sessions = append(sessions, core.AgentSessionInfo{
-			ID:           sf.SessionID,
+			ID:           sessionID,
 			Summary:      summary,
 			MessageCount: msgCount,
 			ModifiedAt:   modTime,

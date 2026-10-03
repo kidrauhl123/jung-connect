@@ -468,6 +468,17 @@ func main() {
 			if proj.SkipGit != nil {
 				engine.SetSkipGit(*proj.SkipGit)
 			}
+			if fb := strings.TrimSpace(proj.FallbackWorkDir); fb != "" {
+				if strings.HasPrefix(fb, "~/") {
+					home, _ := os.UserHomeDir()
+					fb = filepath.Join(home, fb[2:])
+				}
+				if abs, err := filepath.Abs(fb); err == nil {
+					fb = abs
+				}
+				engine.SetFallbackWorkDir(fb)
+				slog.Info("multi-workspace fallback_work_dir set", "project", proj.Name, "fallback_work_dir", fb)
+			}
 			slog.Info("multi-workspace mode enabled", "project", proj.Name, "base_dir", baseDir)
 		}
 
@@ -1923,7 +1934,7 @@ func convertProviderModels(ms []config.ProviderModelConfig) []core.ModelOption {
 	}
 	opts := make([]core.ModelOption, len(ms))
 	for i, m := range ms {
-		opts[i] = core.ModelOption{Name: m.Model, Alias: m.Alias}
+		opts[i] = core.ModelOption{Name: m.Model, Alias: m.Alias, Group: m.Group}
 	}
 	return opts
 }
@@ -1985,14 +1996,15 @@ func configProviderToGlobal(p config.ProviderConfig) core.GlobalProviderInfo {
 		info.Models = append(info.Models, struct {
 			Model string `json:"model"`
 			Alias string `json:"alias,omitempty"`
-		}{Model: m.Model, Alias: m.Alias})
+			Group string `json:"group,omitempty"`
+		}{Model: m.Model, Alias: m.Alias, Group: m.Group})
 	}
 	if len(p.AgentModelLists) > 0 {
 		info.AgentModelLists = make(map[string][]core.GlobalModelEntry, len(p.AgentModelLists))
 		for at, ml := range p.AgentModelLists {
 			entries := make([]core.GlobalModelEntry, len(ml))
 			for i, m := range ml {
-				entries[i] = core.GlobalModelEntry{Model: m.Model, Alias: m.Alias}
+				entries[i] = core.GlobalModelEntry{Model: m.Model, Alias: m.Alias, Group: m.Group}
 			}
 			info.AgentModelLists[at] = entries
 		}
@@ -2019,14 +2031,14 @@ func globalProviderToConfig(info core.GlobalProviderInfo) config.ProviderConfig 
 		AgentModels: info.AgentModels,
 	}
 	for _, m := range info.Models {
-		p.Models = append(p.Models, config.ProviderModelConfig{Model: m.Model, Alias: m.Alias})
+		p.Models = append(p.Models, config.ProviderModelConfig{Model: m.Model, Alias: m.Alias, Group: m.Group})
 	}
 	if len(info.AgentModelLists) > 0 {
 		p.AgentModelLists = make(map[string][]config.ProviderModelConfig, len(info.AgentModelLists))
 		for at, ml := range info.AgentModelLists {
 			entries := make([]config.ProviderModelConfig, len(ml))
 			for i, m := range ml {
-				entries[i] = config.ProviderModelConfig{Model: m.Model, Alias: m.Alias}
+				entries[i] = config.ProviderModelConfig{Model: m.Model, Alias: m.Alias, Group: m.Group}
 			}
 			p.AgentModelLists[at] = entries
 		}
@@ -2046,7 +2058,7 @@ func convertCoreModels(ms []core.ModelOption) []config.ProviderModelConfig {
 	}
 	out := make([]config.ProviderModelConfig, len(ms))
 	for i, m := range ms {
-		out[i] = config.ProviderModelConfig{Model: m.Name, Alias: m.Alias}
+		out[i] = config.ProviderModelConfig{Model: m.Name, Alias: m.Alias, Group: m.Group}
 	}
 	return out
 }

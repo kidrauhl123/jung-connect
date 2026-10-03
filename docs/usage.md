@@ -969,6 +969,8 @@ One bot serving multiple workspaces per channel.
 name = "my-project"
 mode = "multi-workspace"
 base_dir = "~/workspaces"
+# Optional: unbound channels/topics use this dir (like old work_dir) without forced bind/init
+fallback_work_dir = "~/default-workspace"
 
 [projects.agent]
 type = "claudecode"
@@ -988,6 +990,7 @@ type = "claudecode"
 
 - Channel name `#project-a` → auto-binds to `base_dir/project-a/`
 - Each channel has isolated sessions and agent state
+- With `fallback_work_dir`, unbound channels chat there silently; `/workspace bind` / `unbind` still work
 
 ---
 

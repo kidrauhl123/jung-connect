@@ -381,6 +381,9 @@ const (
 	MsgModeUsage                 MsgKey = "mode_usage"
 	MsgLangSelectPlaceholder     MsgKey = "lang_select_placeholder"
 	MsgModelSelectPlaceholder    MsgKey = "model_select_placeholder"
+	MsgModelVendorListTitle      MsgKey = "model_vendor_list_title"
+	MsgModelVendorSelectPlaceholder MsgKey = "model_vendor_select_placeholder"
+	MsgModelVendorBack           MsgKey = "model_vendor_back"
 	MsgModeSelectPlaceholder     MsgKey = "mode_select_placeholder"
 	MsgProviderSelectPlaceholder MsgKey = "provider_select_placeholder"
 	MsgProviderClearOption       MsgKey = "provider_clear_option"
@@ -2563,6 +2566,21 @@ var messages = map[MsgKey]map[Language]string{
 	MsgModelSelectPlaceholder: {
 		LangEnglish: "Select model", LangChinese: "选择模型", LangTraditionalChinese: "選擇模型",
 		LangJapanese: "モデルを選択", LangSpanish: "Seleccionar modelo",
+	},
+	MsgModelVendorListTitle: {
+		LangEnglish:            "Vendors:",
+		LangChinese:            "厂商:",
+		LangTraditionalChinese: "廠商:",
+		LangJapanese:           "ベンダー:",
+		LangSpanish:            "Proveedores:",
+	},
+	MsgModelVendorSelectPlaceholder: {
+		LangEnglish: "Select vendor", LangChinese: "选择厂商", LangTraditionalChinese: "選擇廠商",
+		LangJapanese: "ベンダーを選択", LangSpanish: "Seleccionar proveedor",
+	},
+	MsgModelVendorBack: {
+		LangEnglish: "← Vendors", LangChinese: "← 厂商列表", LangTraditionalChinese: "← 廠商列表",
+		LangJapanese: "← ベンダー", LangSpanish: "← Proveedores",
 	},
 	MsgReasoningSelectPlaceholder: {
 		LangEnglish: "Select reasoning level", LangChinese: "选择推理强度", LangTraditionalChinese: "選擇推理強度",

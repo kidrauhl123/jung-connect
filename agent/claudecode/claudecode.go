@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -382,11 +381,13 @@ func (a *Agent) configuredModels() []core.ModelOption {
 }
 
 func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
-	if models := a.configuredModels(); len(models) > 0 {
-		return models
-	}
+	configured := a.configuredModels()
+	// Prefer live /v1/models so the menu tracks New API; keep toml models as alias shortcuts.
 	if models := a.fetchModelsFromAPI(ctx); len(models) > 0 {
-		return models
+		return core.MergeModelAliases(models, configured)
+	}
+	if len(configured) > 0 {
+		return configured
 	}
 	return []core.ModelOption{
 		{Name: "sonnet", Desc: "Claude Sonnet (balanced)"},
@@ -398,61 +399,23 @@ func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
 }
 
 func (a *Agent) fetchModelsFromAPI(ctx context.Context) []core.ModelOption {
-	a.mu.Lock()
+	a.mu.RLock()
 	apiKey := ""
 	baseURL := ""
 	if a.activeIdx >= 0 && a.activeIdx < len(a.providers) {
 		apiKey = a.providers[a.activeIdx].APIKey
 		baseURL = a.providers[a.activeIdx].BaseURL
 	}
-	a.mu.Unlock()
+	a.mu.RUnlock()
 
-	if apiKey == "" {
-		apiKey = os.Getenv("ANTHROPIC_API_KEY")
-	}
+	baseURL, apiKey = core.ResolveModelsAPICreds(baseURL, apiKey)
 	if apiKey == "" {
 		return nil
-	}
-	if baseURL == "" {
-		baseURL = os.Getenv("ANTHROPIC_BASE_URL")
 	}
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com"
 	}
-	baseURL = strings.TrimRight(baseURL, "/")
-
-	req, err := http.NewRequestWithContext(ctx, "GET", baseURL+"/v1/models", nil)
-	if err != nil {
-		return nil
-	}
-	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		slog.Debug("claudecode: failed to fetch models", "error", err)
-		return nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-
-	var result struct {
-		Data []struct {
-			ID          string `json:"id"`
-			DisplayName string `json:"display_name"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil
-	}
-
-	var models []core.ModelOption
-	for _, m := range result.Data {
-		models = append(models, core.ModelOption{Name: m.ID, Desc: m.DisplayName})
-	}
-	return models
+	return core.FetchOpenAICompatibleModels(ctx, baseURL, apiKey)
 }
 
 func (a *Agent) SetSessionEnv(env []string) {

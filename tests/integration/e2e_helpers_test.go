@@ -23,7 +23,7 @@ func configProviderToCore(p config.ProviderConfig) core.ProviderConfig {
 		Model: p.Model, Thinking: p.Thinking, Env: p.Env,
 	}
 	for _, m := range p.Models {
-		c.Models = append(c.Models, core.ModelOption{Name: m.Model, Alias: m.Alias})
+		c.Models = append(c.Models, core.ModelOption{Name: m.Model, Alias: m.Alias, Group: m.Group})
 	}
 	if p.Codex != nil {
 		c.CodexWireAPI = p.Codex.WireAPI

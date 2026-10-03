@@ -387,19 +387,17 @@ func TestCUJ_B3_SwitchPreservesHistoryEndToEnd(t *testing.T) {
 }
 
 // ===========================================================================
-// CUJ-C4 · /cancel stops current turn AND creates a fresh session
+// CUJ-C4 · /cancel stops the current turn and KEEPS the same session.
 //
-// SPOTLIGHT: This was a 🔴 RED hole in CUJ-INVENTORY (cmdCancel had 0
-// dedicated tests). The /cancel UX is non-obvious — it intentionally combines
-// /stop + clear history + /new. This test locks down ALL three behaviors so
-// any future "simplification" that breaks one of them is caught immediately.
+// It used to be /stop + clear history + /new, which dropped the conversation
+// the user was in. /cancel now matches /stop: halt the turn, keep the session
+// and its history so the next message resumes the same context.
 // ===========================================================================
 
-func TestCUJ_C4_CancelStopsAndStartsFreshSession(t *testing.T) {
+func TestCUJ_C4_CancelKeepsSameSession(t *testing.T) {
 	env := newCUJEnv(t)
 	key := "test:bob"
 
-	// 1. User chats — produces history + agent session ID.
 	env.userSends("bob", "do something long")
 	env.waitFor("first reply", 2*time.Second, func() bool {
 		return len(env.plat.getSent()) >= 1
@@ -407,50 +405,29 @@ func TestCUJ_C4_CancelStopsAndStartsFreshSession(t *testing.T) {
 
 	oldSession := env.activeSession(key)
 	oldSessionID := oldSession.ID
-	// Simulate that an agent session id got attached during the turn —
-	// /cancel should clear it so it cannot be resumed.
 	oldSession.SetAgentSessionID("agent-A", "claude")
 
 	env.waitFor("history persisted", 2*time.Second, func() bool {
 		return len(oldSession.GetHistory(0)) >= 2
 	})
+	historyBefore := len(oldSession.GetHistory(0))
 
-	// 2. User sends /cancel.
 	env.plat.clearSent()
 	env.userSends("bob", "/cancel")
 
-	// 3. Assert user sees the cancellation acknowledgement.
-	env.waitFor("user sees cancellation reply", 2*time.Second, func() bool {
-		return env.sentContains("Session cancelled") || env.sentContains("cancelled")
-	})
-
-	// 4. Assert a NEW active session was created (different ID).
-	newSession := env.activeSession(key)
-	if newSession.ID == oldSessionID {
-		t.Fatalf("/cancel should create a new active session; still on old %s", oldSessionID)
-	}
-
-	// 5. Assert the OLD session's agent_session_id was cleared (so /switch
-	// back cannot resume the cancelled agent turn).
-	if got := oldSession.GetAgentSessionID(); got != "" {
-		t.Fatalf("old session agent_session_id = %q, want empty after /cancel", got)
-	}
-
-	// 6. Assert old session's history was cleared (per current cmdCancel
-	// semantics: cancel == discard the entire interaction).
-	if got := len(oldSession.GetHistory(0)); got != 0 {
-		t.Fatalf("old session history len = %d, want 0 after /cancel (current semantics: cancel discards history)", got)
-	}
-
-	// 7. Assert next user message goes to the NEW session, not the old one.
-	env.plat.clearSent()
-	env.userSends("bob", "fresh start")
-	env.waitFor("agent replies to new session", 2*time.Second, func() bool {
+	env.waitFor("user sees stop reply", 2*time.Second, func() bool {
 		return len(env.plat.getSent()) >= 1
 	})
-	if env.activeSession(key).ID != newSession.ID {
-		t.Fatalf("next message went to %s, want new session %s",
-			env.activeSession(key).ID, newSession.ID)
+
+	kept := env.activeSession(key)
+	if kept.ID != oldSessionID {
+		t.Fatalf("/cancel opened a new session %s; want to stay on %s", kept.ID, oldSessionID)
+	}
+	if got := kept.GetAgentSessionID(); got != "agent-A" {
+		t.Fatalf("agent_session_id = %q, want agent-A so the next message can resume", got)
+	}
+	if got := len(kept.GetHistory(0)); got != historyBefore {
+		t.Fatalf("history len = %d, want %d (cancel must not wipe it)", got, historyBefore)
 	}
 }
 

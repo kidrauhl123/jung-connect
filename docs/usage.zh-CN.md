@@ -882,6 +882,8 @@ cc-connect daemon uninstall
 name = "my-project"
 mode = "multi-workspace"
 base_dir = "~/workspaces"
+# 可选：未绑定的频道/话题直接用这个目录聊天（类似以前的 work_dir），不强制 bind/init
+fallback_work_dir = "~/default-workspace"
 
 [projects.agent]
 type = "claudecode"
@@ -901,6 +903,7 @@ type = "claudecode"
 
 - 频道名 `#project-a` → 自动绑定 `base_dir/project-a/`
 - 每个频道有独立的会话和 Agent 状态
+- 配置了 `fallback_work_dir` 时，未绑定的频道直接在该目录聊天；`/workspace bind` / `unbind` 仍然可用
 
 ---
 

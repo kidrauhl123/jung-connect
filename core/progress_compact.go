@@ -231,6 +231,14 @@ type compactProgressWriter struct {
 	// Throttle message edits to avoid platform rate limits (e.g. Discord ~5 edits/5s).
 	minUpdateInterval time.Duration
 	lastUpdateAt      time.Time
+
+	// lastKind tracks the previous AppendStructured entry kind so successive
+	// thinking deltas can upsert one compact message body instead of stacking
+	// "\n\n💭 ..." segments (Telegram rate-limit / bubble spam).
+	lastKind ProgressCardEntryKind
+
+	// rateLimitLogged avoids spamming Warn on repeated Telegram 429s.
+	rateLimitLogged bool
 }
 
 func normalizeProgressStyle(style string) string {
@@ -436,13 +444,24 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 			w.content = trimCompactProgressText(w.content, compactProgressMaxChars)
 		}
 	default:
-		if w.content == "" {
+		if kind == ProgressEntryThinking && w.lastKind == ProgressEntryThinking {
+			// Growing thinking stream: replace the last thinking segment.
+			if w.content == "" {
+				w.content = fallback
+			} else if idx := strings.LastIndex(w.content, "\n\n"); idx >= 0 {
+				w.content = w.content[:idx] + "\n\n" + fallback
+			} else {
+				// Only a single thinking block so far.
+				w.content = fallback
+			}
+		} else if w.content == "" {
 			w.content = fallback
 		} else {
 			w.content += "\n\n" + fallback
 		}
 		w.content = trimCompactProgressText(w.content, compactProgressMaxChars)
 	}
+	w.lastKind = kind
 
 	if w.content == w.lastSent {
 		return true
@@ -485,6 +504,17 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 	err := w.updater.UpdateMessage(callCtx, w.handle, w.content)
 	cancel()
 	if err != nil {
+		if isProgressRateLimitError(err) {
+			// Keep latest desired content and stay active so a later Append/Finalize
+			// can edit successfully once Telegram's retry window passes.
+			if !w.rateLimitLogged {
+				slog.Warn("progress writer: UpdateMessage rate-limited, keeping writer active", "platform", w.platform.Name(), "style", w.style, "error", err)
+				w.rateLimitLogged = true
+			} else {
+				slog.Debug("progress writer: UpdateMessage rate-limited", "platform", w.platform.Name(), "style", w.style, "error", err)
+			}
+			return true
+		}
 		slog.Warn("progress writer: UpdateMessage failed", "platform", w.platform.Name(), "style", w.style, "error", err)
 		w.failed = true
 		return false
@@ -492,6 +522,21 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 	w.lastSent = w.content
 	w.lastUpdateAt = time.Now()
 	return true
+}
+
+
+// isProgressRateLimitError reports Telegram/Discord-style rate-limit failures
+// where a later edit may succeed. Callers should keep the writer active.
+func isProgressRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "too many requests") ||
+		strings.Contains(s, "retry after") ||
+		strings.Contains(s, "rate limit") ||
+		strings.Contains(s, "rate_limit") ||
+		strings.Contains(s, "429")
 }
 
 // Finalize updates card progress state (running/completed/failed) without

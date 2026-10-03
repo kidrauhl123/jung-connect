@@ -1053,3 +1053,87 @@ func itoa(i int) string {
 	}
 	return string(buf[pos:])
 }
+
+// recordingStdin captures what RespondPermission would have written, so a test
+// can tell an auto-approved tool apart from one handed to the user.
+type recordingStdin struct{ buf bytes.Buffer }
+
+func (r *recordingStdin) Write(p []byte) (int, error) { return r.buf.Write(p) }
+func (r *recordingStdin) Close() error               { return nil }
+
+func newControlSession(t *testing.T, mode string, stdin io.WriteCloser) *claudeSession {
+	ctx, cancel := context.WithCancel(context.Background())
+	cs := &claudeSession{
+		stdin:   stdin,
+		events:  make(chan core.Event, 4),
+		ctx:     ctx,
+		cancel:  cancel,
+		ccHooks: newCCPermissionHookRunner(t.TempDir()),
+	}
+	cs.alive.Store(true)
+	cs.SetLiveMode(mode)
+	return cs
+}
+
+func controlRequest(tool string, input map[string]any) map[string]any {
+	return map[string]any{
+		"type":       "control_request",
+		"request_id": "req-1",
+		"request": map[string]any{
+			"subtype":   "can_use_tool",
+			"tool_name": tool,
+			"input":     input,
+		},
+	}
+}
+
+func TestAskUserQuestionReachesUserEvenWhenAutoApproved(t *testing.T) {
+	in := &recordingStdin{}
+	cs := newControlSession(t, "bypassPermissions", in)
+	defer cs.cancel()
+
+	cs.handleControlRequest(controlRequest("AskUserQuestion", map[string]any{
+		"questions": []any{
+			map[string]any{
+				"question": "走哪条路？",
+				"header":   "路径",
+				"options": []any{
+					map[string]any{"label": "甲", "description": "第一条"},
+					map[string]any{"label": "乙", "description": "第二条"},
+				},
+			},
+		},
+	}))
+
+	if in.buf.Len() != 0 {
+		t.Fatalf("question was auto-answered, stdin got %s", in.buf.String())
+	}
+	select {
+	case evt := <-cs.events:
+		if evt.Type != core.EventPermissionRequest {
+			t.Fatalf("event type = %s, want permission_request", evt.Type)
+		}
+		if len(evt.Questions) != 1 || len(evt.Questions[0].Options) != 2 {
+			t.Fatalf("questions = %+v, want 1 question with 2 options", evt.Questions)
+		}
+	default:
+		t.Fatal("no event emitted; the user would never see the options")
+	}
+}
+
+func TestAutoApproveStillApprovesOtherTools(t *testing.T) {
+	in := &recordingStdin{}
+	cs := newControlSession(t, "bypassPermissions", in)
+	defer cs.cancel()
+
+	cs.handleControlRequest(controlRequest("Bash", map[string]any{"command": "ls"}))
+
+	select {
+	case evt := <-cs.events:
+		t.Fatalf("ordinary tool reached the user: %+v", evt)
+	default:
+	}
+	if !strings.Contains(in.buf.String(), `"behavior":"allow"`) {
+		t.Fatalf("stdin = %s, want an allow response", in.buf.String())
+	}
+}

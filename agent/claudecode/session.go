@@ -904,29 +904,35 @@ func (cs *claudeSession) handleControlRequest(raw map[string]any) {
 	toolName, _ := request["tool_name"].(string)
 	input, _ := request["input"].(map[string]any)
 
-	if cs.autoApprove.Load() {
-		slog.Debug("claudeSession: auto-approving", "request_id", requestID, "tool", toolName)
-		_ = cs.RespondPermission(requestID, core.PermissionResult{
-			Behavior:     "allow",
-			UpdatedInput: input,
-		})
-		return
-	}
-	if cs.dontAsk.Load() {
-		slog.Debug("claudeSession: auto-denying", "request_id", requestID, "tool", toolName)
-		_ = cs.RespondPermission(requestID, core.PermissionResult{
-			Behavior: "deny",
-			Message:  "Permission mode is set to dontAsk.",
-		})
-		return
-	}
-	if cs.acceptEditsOnly.Load() && isClaudeEditTool(toolName) {
-		slog.Debug("claudeSession: auto-approving edit tool", "request_id", requestID, "tool", toolName)
-		_ = cs.RespondPermission(requestID, core.PermissionResult{
-			Behavior:     "allow",
-			UpdatedInput: input,
-		})
-		return
+	// AskUserQuestion is a question for the user, not a tool to approve.
+	// Auto-approving it answers "allow" with no choice, so Claude waits out
+	// its own timer and reports that the user never replied. Always hand it
+	// to the engine, which renders the options as buttons.
+	if toolName != "AskUserQuestion" {
+		if cs.autoApprove.Load() {
+			slog.Debug("claudeSession: auto-approving", "request_id", requestID, "tool", toolName)
+			_ = cs.RespondPermission(requestID, core.PermissionResult{
+				Behavior:     "allow",
+				UpdatedInput: input,
+			})
+			return
+		}
+		if cs.dontAsk.Load() {
+			slog.Debug("claudeSession: auto-denying", "request_id", requestID, "tool", toolName)
+			_ = cs.RespondPermission(requestID, core.PermissionResult{
+				Behavior: "deny",
+				Message:  "Permission mode is set to dontAsk.",
+			})
+			return
+		}
+		if cs.acceptEditsOnly.Load() && isClaudeEditTool(toolName) {
+			slog.Debug("claudeSession: auto-approving edit tool", "request_id", requestID, "tool", toolName)
+			_ = cs.RespondPermission(requestID, core.PermissionResult{
+				Behavior:     "allow",
+				UpdatedInput: input,
+			})
+			return
+		}
 	}
 
 	// Check Claude Code's PermissionRequest hooks before forwarding to platform.
