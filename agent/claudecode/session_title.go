@@ -17,8 +17,8 @@ import (
 
 const (
 	sessionTitleMaxInputChars = 1000
-	sessionTitleMaxTokens     = 80
-	sessionTitleHTTPTimeout   = 12 * time.Second
+	sessionTitleMaxTokens     = 256
+	sessionTitleHTTPTimeout   = 45 * time.Second
 )
 
 const sessionTitleSystemPrompt = `You are naming a coding session so the user can pick it out of a long list of sessions. The title is a name for what the session is about, not a sentence describing the task: a short noun phrase of two to five words, in sentence case (capitalize only the first word, plus proper nouns, acronyms, and code identifiers exactly as written). Write the title in the predominant language of the session. Return JSON with a single "title" field. Do not echo the user's message.`
@@ -113,7 +113,7 @@ type envSessionTitleClient struct {
 }
 
 func newEnvSessionTitleClient(env []string) sessionTitleClient {
-	var base, auth, apiKey, haiku, model string
+	var base, auth, apiKey, haiku, model, titleModel string
 	for _, entry := range env {
 		k, v, ok := strings.Cut(entry, "=")
 		if !ok {
@@ -130,16 +130,22 @@ func newEnvSessionTitleClient(env []string) sessionTitleClient {
 			haiku = strings.TrimSpace(v)
 		case "ANTHROPIC_MODEL":
 			model = strings.TrimSpace(v)
+		case "CC_CONNECT_SESSION_TITLE_MODEL":
+			titleModel = strings.TrimSpace(v)
 		}
 	}
 	key := auth
 	if key == "" {
 		key = apiKey
 	}
-	if haiku != "" {
+	if titleModel != "" {
+		model = titleModel
+	} else if haiku != "" {
 		model = haiku
 	}
 	if base == "" || key == "" || model == "" {
+		slog.Warn("claudecode: session title client not configured",
+			"has_base", base != "", "has_key", key != "", "has_model", model != "", "has_haiku", haiku != "")
 		return nil
 	}
 	return &envSessionTitleClient{
@@ -163,9 +169,11 @@ func (c *envSessionTitleClient) GenerateTitle(ctx context.Context, prompt string
 		return "", fmt.Errorf("title client not configured")
 	}
 	body, err := json.Marshal(map[string]any{
-		"model":      c.model,
-		"max_tokens": sessionTitleMaxTokens,
-		"system":     sessionTitleSystemPrompt,
+		"model":            c.model,
+		"max_tokens":       sessionTitleMaxTokens,
+		"system":           sessionTitleSystemPrompt,
+		"reasoning_effort": "low",
+		"thinking":         map[string]any{"type": "disabled"},
 		"messages": []map[string]string{
 			{"role": "user", "content": "<session>\n" + prompt + "\n</session>"},
 		},
@@ -192,7 +200,11 @@ func (c *envSessionTitleClient) GenerateTitle(ctx context.Context, prompt string
 		return "", err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("title http %d", resp.StatusCode)
+		msg := strings.TrimSpace(string(raw))
+		if len(msg) > 200 {
+			msg = msg[:200] + "..."
+		}
+		return "", fmt.Errorf("title http %d: %s", resp.StatusCode, msg)
 	}
 
 	var anth struct {
@@ -234,7 +246,11 @@ func (c *envSessionTitleClient) GenerateTitle(ctx context.Context, prompt string
 }
 
 func (cs *claudeSession) maybeGenerateSessionTitle(prompt string) {
-	if cs == nil || cs.titleClient == nil {
+	if cs == nil {
+		return
+	}
+	if cs.titleClient == nil {
+		slog.Warn("claudecode: skip session title generation; title client is nil")
 		return
 	}
 	source := titleSourceText(prompt)
@@ -253,13 +269,13 @@ func (cs *claudeSession) runSessionTitleGeneration(source string) {
 	raw, err := cs.titleClient.GenerateTitle(ctx, source)
 	if err != nil {
 		cs.titled.Store(false)
-		slog.Debug("claudecode: session title generation failed", "error", err)
+		slog.Warn("claudecode: session title generation failed", "error", err)
 		return
 	}
 	title := acceptGeneratedSessionTitle(source, raw)
 	if title == "" {
 		cs.titled.Store(false)
-		slog.Debug("claudecode: session title rejected", "reason", "empty or echoed prompt")
+		slog.Warn("claudecode: session title rejected", "reason", "empty or echoed prompt")
 		return
 	}
 	evt := core.Event{Type: core.EventSessionTitle, Content: title, SessionID: cs.CurrentSessionID()}

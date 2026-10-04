@@ -1308,8 +1308,8 @@ app_secret = "your-feishu-app-secret"
 #                                 # 默认 false：机器人进过的帖里后续消息不用再 @；多 bot 同帖请设 true
 # reactions = true          # Hermes-style 👀/✅/❌ on the user's message (needs Add Reactions permission)
 #                           # 默认 true：在用户消息上贴进度灯；取消只摘 👀，不读用户点的表情
-# reply_to_mode = "first"   # off | first | all — first chunk of each send is a Discord reply (Hermes)
-#                           # first：每次发出的第一段挂「回复」；后续分段不挂。off 全不挂，all 每段都挂
+# reply_to_mode = "first"   # off | first | all — first chunk of each final Send is a Discord reply (Hermes)
+#                           # first：终稿第一段挂「回复」；过程/预览不挂。off 全不挂，all 终稿每段都挂
 # progress_style = "legacy"  # Progress rendering: legacy | compact | card / 进度展示方式：legacy | compact | card
 #                            # card = one editable Discord embed progress card / card = 单条可编辑的 Discord 嵌入式进度卡
 # reply_hud = false  # If true, append final-reply HUD line (model/context/tokens) in Discord only

@@ -10883,6 +10883,40 @@ func TestCmdStop_ReturnsWhileCloseBlockedAndStopsEventLoop(t *testing.T) {
 	}
 }
 
+type typingStubPlatform struct {
+	stubPlatformEngine
+	started atomic.Int32
+	stopped atomic.Int32
+}
+
+func (p *typingStubPlatform) StartTyping(_ context.Context, _ any) func() {
+	p.started.Add(1)
+	return func() { p.stopped.Add(1) }
+}
+
+func TestCmdStop_StopsTypingImmediately(t *testing.T) {
+	p := &typingStubPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	sess := newBlockingCloseSession("stop-typing")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	key := "test:user1"
+	stop := onceFunc(p.StartTyping(context.Background(), "ctx"))
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	state.setStopTyping(stop)
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	e.cmdStop(p, &Message{SessionKey: key, ReplyCtx: "ctx"})
+	if p.stopped.Load() != 1 {
+		t.Fatalf("typing stop calls = %d, want 1 immediately on /stop", p.stopped.Load())
+	}
+	close(sess.releaseClose)
+}
+
 func TestHandleMessageRecallStopsCurrentMessageSilently(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	sess := newBlockingCloseSession("recall-active")

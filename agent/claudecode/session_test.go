@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -222,6 +224,116 @@ func TestAcceptGeneratedSessionTitle_RejectsPlaceholder(t *testing.T) {
 	if got := acceptGeneratedSessionTitle(prompt, "Fix login button"); got != "Fix login button" {
 		t.Fatalf("got %q", got)
 	}
+}
+
+func TestNewEnvSessionTitleClient_NilWhenIncomplete(t *testing.T) {
+	if got := newEnvSessionTitleClient(nil); got != nil {
+		t.Fatal("empty env should not build a title client")
+	}
+	if got := newEnvSessionTitleClient([]string{
+		"ANTHROPIC_BASE_URL=https://example.invalid",
+		"ANTHROPIC_MODEL=haiku",
+	}); got != nil {
+		t.Fatal("missing key should not build a title client")
+	}
+}
+
+func TestEnvSessionTitleClient_GenerateTitle(t *testing.T) {
+	var gotModel, gotAuth, gotAPIKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Errorf("path = %s, want /v1/messages", r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		gotAPIKey = r.Header.Get("x-api-key")
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotModel = body.Model
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"{\"title\":\"Fix login button\"}"}]}`))
+	}))
+	defer srv.Close()
+
+	client := newEnvSessionTitleClient([]string{
+		"ANTHROPIC_BASE_URL=" + srv.URL,
+		"ANTHROPIC_AUTH_TOKEN=secret-token",
+		"ANTHROPIC_API_KEY=",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL=haiku-test",
+		"ANTHROPIC_MODEL=should-not-win",
+	})
+	if client == nil {
+		t.Fatal("expected title client from provider env")
+	}
+	title, err := client.GenerateTitle(context.Background(), "please look at the login button")
+	if err != nil {
+		t.Fatalf("GenerateTitle: %v", err)
+	}
+	if title != "Fix login button" {
+		t.Fatalf("title = %q", title)
+	}
+	if gotModel != "haiku-test" {
+		t.Fatalf("model = %q, want haiku-test", gotModel)
+	}
+	if gotAuth != "Bearer secret-token" || gotAPIKey != "secret-token" {
+		t.Fatalf("auth headers missing")
+	}
+}
+
+func TestEnvSessionTitleClient_PrefersDedicatedTitleModel(t *testing.T) {
+	var gotModel string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotModel = body.Model
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"{\"title\":\"Fix login button\"}"}]}`))
+	}))
+	defer srv.Close()
+	client := newEnvSessionTitleClient([]string{
+		"ANTHROPIC_BASE_URL=" + srv.URL,
+		"ANTHROPIC_AUTH_TOKEN=secret-token",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL=grok-4.6-high",
+		"CC_CONNECT_SESSION_TITLE_MODEL=gemini-3.8-flash-low",
+	})
+	title, err := client.GenerateTitle(context.Background(), "please look at the login button")
+	if err != nil {
+		t.Fatalf("GenerateTitle: %v", err)
+	}
+	if title != "Fix login button" {
+		t.Fatalf("title = %q", title)
+	}
+	if gotModel != "gemini-3.8-flash-low" {
+		t.Fatalf("model = %q, want gemini-3.8-flash-low", gotModel)
+	}
+}
+
+func TestEnvSessionTitleClient_HTTPErrorIncludesBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"no access to haiku"}}`))
+	}))
+	defer srv.Close()
+	client := newEnvSessionTitleClient([]string{
+		"ANTHROPIC_BASE_URL=" + srv.URL,
+		"ANTHROPIC_AUTH_TOKEN=secret-token",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL=haiku-test",
+	})
+	_, err := client.GenerateTitle(context.Background(), "please look at the login button")
+	if err == nil {
+		t.Fatal("expected http error")
+	}
+	if !strings.Contains(err.Error(), "title http 403") || !strings.Contains(err.Error(), "no access to haiku") {
+		t.Fatalf("error = %v, want status and body", err)
+	}
+}
+
+func TestMaybeGenerateSessionTitle_NilClientDoesNotPanic(t *testing.T) {
+	cs := &claudeSession{}
+	cs.maybeGenerateSessionTitle("please look at the login button")
 }
 
 // TestHandleResultCompactionSubtypeIsNotTerminal is a regression test for

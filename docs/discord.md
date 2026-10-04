@@ -122,7 +122,7 @@ token = "MTk4NjIyNDgzNDcOTY3NDUxMg.G8vKqh.xxx..."
 > Threads this bot **just created** start with a placeholder name (the user's first message, mentions stripped). After the first agent turn, if Claude/Antigravity produces an LLM session title, jung-connect renames that thread — only while Discord still shows the placeholder. A human rename, a forum post the bot did not create, or a later title update is left alone.
 > `progress_style = "compact"` merges thinking/tool updates into one editable message; `progress_style = "card"` renders a Discord-native embed progress card and still sends the final answer as a normal message.
 > Progress light (default on, `reactions = true`): 👀 while working, ✅ on success, ❌ on failure. Cancel only removes 👀. The bot never reads reactions you add.
-> `reply_to_mode` (default `first`): the first chunk of each send is a Discord reply to your message, including inside `thread_isolation` threads. Later chunks in that send are not replies. `off` never replies; `all` replies on every chunk.
+> `reply_to_mode` (default `first`): the first chunk of each **final Send** is a Discord reply to your message, including inside `thread_isolation` threads. Progress/preview (`SendPreviewStart`) never replies — Hermes does not thread commentary. The reply's `channel_id` is the **thread** (the send target), not the parent that owns the starter — Discord rejects `REPLIES_CANNOT_REFERENCE_OTHER_CHANNEL` otherwise, and the answer never lands. Later chunks in that send are not replies. `off` never replies; `all` replies on every chunk. A rejected reference (deleted target, system message, or cross-channel) is retried without the reply.
 
 ---
 
@@ -302,11 +302,13 @@ Existing threads are not backfilled: after a deploy, @ once (or send a slash com
 
 The bot puts them on **your** message as a progress light (Hermes-style). 👀 while it works, ✅ when the turn succeeds, ❌ if it fails. Cancel only removes 👀. The bot does **not** read reactions you add. Needs the Add Reactions permission; set `reactions = false` to turn this off.
 
-`reply_to_mode` (default `first`) controls Discord "reply": the first chunk of each send references your message — including inside a `thread_isolation` thread. Later chunks in that send do not. `off` never replies; `all` replies on every chunk.
+`reply_to_mode` (default `first`) controls Discord "reply" on the **final answer**: the first chunk of each Send references your message — including inside a `thread_isolation` thread, with the reference channel set to the thread (not the parent). Progress/preview messages do not reply. Later chunks in that send do not. `off` never replies; `all` replies on every chunk. If Discord rejects the reference, the chunk is sent again without it.
 
 ### Q: Does the bot rename Discord threads?
 
-Yes, Hermes-style: only threads **this bot just opened**. The first name is a placeholder from the user's message. After the first turn, an LLM session title (Claude `ai-title`, Antigravity annotation title) replaces it — unless someone already renamed the thread. Forum posts and existing threads are not rewritten.
+Yes, Hermes-style: only threads **this bot just opened**. The first name is a placeholder from the user's message. After the first turn, an LLM session title replaces it — unless someone already renamed the thread. Forum posts and existing threads are not rewritten.
+
+Claude Code 2.1+ print/stream-json no longer emits `ai-title`. cc-connect generates that title once from the first user prompt (provider Anthropic-compatible API; model prefers `CC_CONNECT_SESSION_TITLE_MODEL`, then `ANTHROPIC_DEFAULT_HAIKU_MODEL`, then `ANTHROPIC_MODEL`) and still applies a late `EventSessionTitle` after the first turn. It does **not** PATCH the user's first message as the title. Map haiku to a model the token can call — an unmapped `haiku` / `claude-3-5-haiku-latest` name 403s. Do not use a thinking model (`grok-4.6-high`) for titles: `/v1/messages` can exceed the title timeout and only warn (`session title generation failed`). Prefer a fast text model via `CC_CONNECT_SESSION_TITLE_MODEL` (this fleet: `gemini-3.8-flash-low`). Title HTTP failures log at warn (`session title generation failed` / `title client is nil`), not debug. Placeholder names persist under `data_dir/discord_auto_thread_placeholders_<project>.json` so a restart does not forget which threads this bot just opened. `/stop` stops Discord typing immediately (does not wait for the event loop).
 
 ### Q: Bot has insufficient permissions?
 

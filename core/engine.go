@@ -583,6 +583,11 @@ type interactiveState struct {
 	// currentTurnUserMessageTimeMs is the UserMessageTimeMs for the in-flight
 	// foreground turn (including a queued turn after EventResult).
 	currentTurnUserMessageTimeMs int64
+
+	// stopTyping is the current turn's typing-indicator stopper. /stop and
+	// /model must call it immediately — Discord's ticker keeps "正在输入"
+	// alive until this runs, even after the agent process is gone.
+	stopTyping func()
 }
 
 // latestUserMessageWatermarkLocked returns the highest UserMessageTimeMs among
@@ -741,6 +746,36 @@ func (s *interactiveState) markStopped() {
 		s.stopCh = make(chan struct{})
 	}
 	close(s.stopCh)
+}
+
+func onceFunc(fn func()) func() {
+	if fn == nil {
+		return nil
+	}
+	var once sync.Once
+	return func() { once.Do(fn) }
+}
+
+func (s *interactiveState) setStopTyping(fn func()) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.stopTyping = fn
+	s.mu.Unlock()
+}
+
+func (s *interactiveState) clearAndStopTyping() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	fn := s.stopTyping
+	s.stopTyping = nil
+	s.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // resolve safely closes the Resolved channel exactly once.
@@ -3847,13 +3882,14 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	// stopping/restarting it across queued message turns.
 	var stopTyping func()
 	if ti, ok := p.(TypingIndicator); ok {
-		stopTyping = ti.StartTyping(e.ctx, msg.ReplyCtx)
+		stopTyping = onceFunc(ti.StartTyping(e.ctx, msg.ReplyCtx))
+		state.setStopTyping(stopTyping)
 	}
 	defer func() {
 		// Stop typing if ownership was NOT transferred to processInteractiveEvents
 		// (i.e. an early return before that call).
 		if stopTyping != nil {
-			stopTyping()
+			state.clearAndStopTyping()
 		}
 	}()
 
@@ -4340,6 +4376,7 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 		e.stopUnsolicitedReader(state)
 
 		state.markStopped()
+		state.clearAndStopTyping()
 
 		// Resolve any pending permission so the reader goroutine (or event
 		// loop) does not block on <-pending.Resolved forever.
@@ -5031,17 +5068,18 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	sessionTitle := ""
 
 	// stopTyping tracks the current turn's typing indicator so it can be
-	// stopped when a queued message starts a new turn.
-	stopTyping := stopTypingFn
+	// stopped when a queued message starts a new turn. Wrap once so /stop
+	// (which calls clearAndStopTyping) and this defer cannot double-close
+	// Discord's typing ticker.
+	stopTyping := onceFunc(stopTypingFn)
+	state.setStopTyping(stopTyping)
 	// doneReaction / failReaction run after stopTyping so the in-progress
 	// mark (👀) is cleared before ✅ / ❌ is added. Cancelled turns leave
 	// both nil — stopTyping still runs.
 	var doneReaction func()
 	var failReaction func()
 	defer func() {
-		if stopTyping != nil {
-			stopTyping()
-		}
+		state.clearAndStopTyping()
 		if failReaction != nil {
 			failReaction()
 			return
@@ -5766,7 +5804,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				idleTimer.Stop()
 			}
 
-			<-pending.Resolved
+			select {
+			case <-pending.Resolved:
+			case <-stopCh:
+				sp.discard()
+				return
+			}
 			slog.Info("permission resolved", "request_id", event.RequestID)
 
 			// The stream preview was frozen+detached when this permission
@@ -6194,13 +6237,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.mu.Unlock()
 
 				// Stop the previous turn's typing indicator
-				if stopTyping != nil {
-					stopTyping()
-					stopTyping = nil
-				}
+				state.clearAndStopTyping()
+				stopTyping = nil
 				// Start a new typing indicator for the queued message's context
 				if ti, ok := queued.platform.(TypingIndicator); ok {
-					stopTyping = ti.StartTyping(e.ctx, queued.replyCtx)
+					stopTyping = onceFunc(ti.StartTyping(e.ctx, queued.replyCtx))
+					state.setStopTyping(stopTyping)
 				}
 				// Agent continues working — don't add done/fail reaction for this turn.
 				doneReaction = nil
@@ -6569,7 +6611,8 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 
 		var stopTyping func()
 		if ti, ok := queued.platform.(TypingIndicator); ok {
-			stopTyping = ti.StartTyping(e.ctx, queued.replyCtx)
+			stopTyping = onceFunc(ti.StartTyping(e.ctx, queued.replyCtx))
+			state.setStopTyping(stopTyping)
 		}
 
 		slog.Info("processing queued message", "session", sessionKey)
@@ -10504,6 +10547,7 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 	closePlatform := state.platform
 	closeReplyCtx := state.replyCtx
 	state.mu.Unlock()
+	state.clearAndStopTyping()
 
 	// If the agent session supports graceful turn cancellation (e.g. ACP),
 	// send a cancel notification and keep the session alive for the next

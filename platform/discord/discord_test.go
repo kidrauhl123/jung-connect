@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -1160,8 +1162,66 @@ func TestSend_ReplyToModeFirst_ThreadIsolationStillReferences(t *testing.T) {
 	if ref == nil || ref["message_id"] != "user-msg" {
 		t.Fatalf("thread send reference = %#v, want user-msg", payload["message_reference"])
 	}
-	if ref["channel_id"] != "parent-1" {
-		t.Fatalf("reference channel_id = %#v, want parent-1 (source of user message)", ref["channel_id"])
+	// Discord rejects a reply whose channel_id is not the send target
+	// (REPLIES_CANNOT_REFERENCE_OTHER_CHANNEL). Hermes points the
+	// reference at the thread, not the parent that owns the starter.
+	if ref["channel_id"] != "thread-1" {
+		t.Fatalf("reference channel_id = %#v, want thread-1 (send target)", ref["channel_id"])
+	}
+}
+
+func TestSend_CrossChannelReplyReferenceRetriesWithoutReply(t *testing.T) {
+	var posts []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload := decodeDiscordPayload(t, r)
+		posts = append(posts, payload)
+		if _, ok := payload["message_reference"]; ok && len(posts) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprint(w, `{"message":"Invalid Form Body","code":50035,"errors":{"message_reference":{"_errors":[{"code":"REPLIES_CANNOT_REFERENCE_OTHER_CHANNEL","message":"Cannot reply to a message in a different channel"}]}}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"out-1","channel_id":"thread-1"}`)
+	}))
+	defer server.Close()
+
+	p := &Platform{session: newTestDiscordSession(t, server), replyToMode: "first", threadIsolation: true}
+	rc := newReplyContext("thread-1", "user-msg", "thread-1", "parent-1")
+	if err := p.Send(context.Background(), rc, "hello in thread"); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if len(posts) != 2 {
+		t.Fatalf("posts = %d, want 2 (cross-channel 50035 then retry)", len(posts))
+	}
+	if _, ok := posts[1]["message_reference"]; ok {
+		t.Fatalf("retry still had message_reference: %#v", posts[1])
+	}
+}
+
+func TestSendPreviewStart_OmitsReplyReference(t *testing.T) {
+	var posts []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts = append(posts, decodeDiscordPayload(t, r))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"preview-1","channel_id":"thread-1"}`)
+	}))
+	defer server.Close()
+
+	p := &Platform{session: newTestDiscordSession(t, server), replyToMode: "first", threadIsolation: true}
+	rc := newReplyContext("thread-1", "user-msg", "thread-1", "parent-1")
+	handle, err := p.SendPreviewStart(context.Background(), rc, "preview")
+	if err != nil {
+		t.Fatalf("SendPreviewStart() error = %v", err)
+	}
+	if handle == nil {
+		t.Fatal("SendPreviewStart() handle is nil")
+	}
+	if len(posts) != 1 {
+		t.Fatalf("posts = %d, want 1", len(posts))
+	}
+	if _, ok := posts[0]["message_reference"]; ok {
+		t.Fatalf("progress preview should not carry message_reference: %#v", posts[0]["message_reference"])
 	}
 }
 
@@ -1911,6 +1971,39 @@ func TestAttachAutoThreadPlaceholder_FollowUpUsesStoredName(t *testing.T) {
 	if gone.autoThreadInitialName != "" {
 		t.Fatalf("forgotten placeholder still attached: %q", gone.autoThreadInitialName)
 	}
+}
+
+func TestAutoThreadPlaceholder_PersistsAcrossLoad(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "placeholders.json")
+	p := &Platform{placeholderStorePath: path}
+	p.rememberAutoThreadPlaceholder("t1", "look at this")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("placeholder file not written: %v", err)
+	}
+	p2 := &Platform{placeholderStorePath: path}
+	p2.loadAutoThreadPlaceholders()
+	if got := p2.autoThreadPlaceholder("t1"); got != "look at this" {
+		t.Fatalf("loaded placeholder = %q, want look at this", got)
+	}
+}
+
+func TestStartTyping_StopIsIdempotent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut || r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{}`)
+	}))
+	defer server.Close()
+
+	p := &Platform{session: newTestDiscordSession(t, server), reactions: true}
+	rc := newReplyContext("ch-1", "user-msg", "", "ch-1")
+	stop := p.StartTyping(context.Background(), rc)
+	stop()
+	stop()
 }
 
 // ── applyReferencedMessage tests ─────────────────────────────

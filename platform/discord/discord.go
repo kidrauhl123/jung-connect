@@ -34,8 +34,10 @@ type replyContext struct {
 	messageID string
 	threadID  string
 	// sourceChannelID is the channel that owns messageID (parent, when a
-	// thread was just created from that message). Reactions and reply
-	// references must use this, not the send target.
+	// thread was just created from that message). Reactions must use this,
+	// not the send target. Reply references must use the send target —
+	// Discord rejects REPLIES_CANNOT_REFERENCE_OTHER_CHANNEL if the
+	// reference channel is the parent while the body is posted in the thread.
 	sourceChannelID string
 	// autoThreadInitialName is the placeholder name used when this bot
 	// created the thread. Semantic rename only proceeds while Discord
@@ -81,6 +83,7 @@ type Platform struct {
 	self                       core.Platform
 	participatedThreads        participatedThreadSet
 	threadStorePath            string
+	placeholderStorePath       string
 	autoThreadPlaceholders     sync.Map // threadID -> placeholder name used at create
 
 	mu               sync.RWMutex
@@ -171,8 +174,10 @@ func New(opts map[string]any) (core.Platform, error) {
 		replyToMode:                replyToMode,
 		proxyURL:                   proxyU,
 		threadStorePath:            participatedThreadStorePath(opts),
+		placeholderStorePath:       autoThreadPlaceholderStorePath(opts),
 	}
 	base.loadParticipatedThreads()
+	base.loadAutoThreadPlaceholders()
 	if progressStyle == "compact" || progressStyle == "card" {
 		wrapped := &progressPlatform{Platform: base}
 		base.self = wrapped
@@ -243,6 +248,19 @@ func participatedThreadStorePath(opts map[string]any) string {
 		name = "default"
 	}
 	return filepath.Join(dataDir, "discord_participated_threads_"+name+".json")
+}
+
+func autoThreadPlaceholderStorePath(opts map[string]any) string {
+	dataDir, _ := opts["cc_data_dir"].(string)
+	project, _ := opts["cc_project"].(string)
+	if strings.TrimSpace(dataDir) == "" {
+		return ""
+	}
+	name := strings.TrimSpace(project)
+	if name == "" {
+		name = "default"
+	}
+	return filepath.Join(dataDir, "discord_auto_thread_placeholders_"+name+".json")
 }
 
 func (p *Platform) loadParticipatedThreads() {
@@ -347,6 +365,7 @@ func (p *Platform) rememberAutoThreadPlaceholder(threadID, name string) {
 		return
 	}
 	p.autoThreadPlaceholders.Store(threadID, name)
+	p.persistAutoThreadPlaceholders()
 }
 
 func (p *Platform) autoThreadPlaceholder(threadID string) string {
@@ -366,6 +385,65 @@ func (p *Platform) forgetAutoThreadPlaceholder(threadID string) {
 		return
 	}
 	p.autoThreadPlaceholders.Delete(threadID)
+	p.persistAutoThreadPlaceholders()
+}
+
+func (p *Platform) loadAutoThreadPlaceholders() {
+	if p == nil || p.placeholderStorePath == "" {
+		return
+	}
+	data, err := os.ReadFile(p.placeholderStorePath)
+	if err != nil {
+		return
+	}
+	var names map[string]string
+	if err := json.Unmarshal(data, &names); err != nil {
+		slog.Debug("discord: load auto-thread placeholders failed", "path", p.placeholderStorePath, "error", err)
+		return
+	}
+	for id, name := range names {
+		id = strings.TrimSpace(id)
+		name = strings.TrimSpace(name)
+		if id == "" || name == "" {
+			continue
+		}
+		p.autoThreadPlaceholders.Store(id, name)
+	}
+}
+
+func (p *Platform) persistAutoThreadPlaceholders() {
+	if p == nil || p.placeholderStorePath == "" {
+		return
+	}
+	names := make(map[string]string)
+	p.autoThreadPlaceholders.Range(func(key, value any) bool {
+		id, _ := key.(string)
+		name, _ := value.(string)
+		id = strings.TrimSpace(id)
+		name = strings.TrimSpace(name)
+		if id != "" && name != "" {
+			names[id] = name
+		}
+		return true
+	})
+	data, err := json.Marshal(names)
+	if err != nil {
+		slog.Debug("discord: persist auto-thread placeholders marshal failed", "error", err)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p.placeholderStorePath), 0o755); err != nil {
+		slog.Debug("discord: persist auto-thread placeholders mkdir failed", "path", p.placeholderStorePath, "error", err)
+		return
+	}
+	tmp := p.placeholderStorePath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		slog.Debug("discord: persist auto-thread placeholders write failed", "path", tmp, "error", err)
+		return
+	}
+	if err := os.Rename(tmp, p.placeholderStorePath); err != nil {
+		_ = os.Remove(tmp)
+		slog.Debug("discord: persist auto-thread placeholders rename failed", "path", p.placeholderStorePath, "error", err)
+	}
 }
 
 func (p *Platform) attachAutoThreadPlaceholder(rc replyContext) replyContext {
@@ -506,7 +584,7 @@ func (rc replyContext) messageReference() *discordgo.MessageReference {
 	failIfNotExists := false
 	return &discordgo.MessageReference{
 		MessageID:       rc.messageID,
-		ChannelID:       rc.reactionChannelID(),
+		ChannelID:       rc.targetChannelID(),
 		FailIfNotExists: &failIfNotExists,
 	}
 }
@@ -533,7 +611,11 @@ func isDiscordReplyReferenceRejected(err error) bool {
 	if strings.Contains(text, "10008") {
 		return true
 	}
-	return strings.Contains(text, "50035") && strings.Contains(strings.ToLower(text), "system message")
+	if strings.Contains(text, "REPLIES_CANNOT_REFERENCE_OTHER_CHANNEL") {
+		return true
+	}
+	lower := strings.ToLower(text)
+	return strings.Contains(text, "50035") && (strings.Contains(lower, "system message") || strings.Contains(lower, "cannot reply to a message in a different channel"))
 }
 
 type discordThreadOps interface {
@@ -1300,8 +1382,9 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 	}
 }
 
-// Send delivers a channel message. Hermes reply_to_mode applies here too:
-// the engine's final answer uses Send, not Reply.
+// Send delivers a channel message. Hermes reply_to_mode applies here:
+// the engine's final answer uses Send, not Reply. Progress uses
+// SendPreviewStart and never carries a reply reference.
 func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	switch rc := rctx.(type) {
 	case *interactionReplyCtx:
@@ -1367,8 +1450,8 @@ func (p *Platform) sendChannel(rc replyContext, content string) error {
 
 // sendChannelMessages is Hermes reply_to_mode: the first chunk of this
 // Send (and every chunk when mode=all) carries message_reference. Thread
-// isolation still replies to the user message — sending into the thread
-// does not drop the reference.
+// isolation still replies to the user message; the reference channel is
+// the send target (the thread), not the parent that owns the starter.
 func (p *Platform) sendChannelMessages(rc replyContext, content string) error {
 	p.recordKnownThreadParticipation(rc.targetChannelID(), rc.threadID)
 	chunks := core.SplitMessageCodeFenceAware(wrapTablesInCodeBlocks(content), maxDiscordLen)
@@ -1622,6 +1705,7 @@ type discordPreviewHandle struct {
 }
 
 // SendPreviewStart sends a new message and returns a handle for subsequent edits.
+// Progress/preview is not a Discord "reply" — Hermes only threads the final Send.
 func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content string) (any, error) {
 	var channelID string
 	switch rc := rctx.(type) {
@@ -1634,17 +1718,7 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 	}
 
 	msg := buildDiscordPreviewMessage(content)
-	if rc, ok := rctx.(replyContext); ok {
-		if ref := rc.referenceForChunk(p.effectiveReplyToMode(), 0); ref != nil {
-			msg.Reference = ref
-		}
-	}
 	sent, err := p.session.ChannelMessageSendComplex(channelID, msg)
-	if err != nil && msg.Reference != nil && isDiscordReplyReferenceRejected(err) {
-		slog.Warn("discord: preview reply target rejected the reply reference; retrying without it")
-		msg.Reference = nil
-		sent, err = p.session.ChannelMessageSendComplex(channelID, msg)
-	}
 	if err != nil {
 		return nil, fmt.Errorf("discord: send preview: %w", err)
 	}
@@ -1738,11 +1812,14 @@ func (p *Platform) StartTyping(ctx context.Context, rctx any) (stop func()) {
 		}
 	}()
 
+	var once sync.Once
 	return func() {
-		close(done)
-		if p.reactions && msgID != "" {
-			p.removeOwnReaction(reactCh, msgID, discordAckEmoji)
-		}
+		once.Do(func() {
+			close(done)
+			if p.reactions && msgID != "" {
+				p.removeOwnReaction(reactCh, msgID, discordAckEmoji)
+			}
+		})
 	}
 }
 
