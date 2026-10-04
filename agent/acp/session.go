@@ -375,8 +375,9 @@ func (s *acpSession) SetLiveMode(mode string) bool {
 }
 
 // SetLiveModel applies a model change to the running session via
-// `session/set_config_option` with configId=model. Grok ACP expects the
-// nested value shape `{ "value": "<model-id>" }`.
+// `session/set_config_option` with configId=model. Grok ACP's
+// SessionConfigOptionValue is an untagged enum that accepts a plain
+// string id. The nested `{ "value": "<id>" }` shape -32602s.
 func (s *acpSession) SetLiveModel(model string) bool {
 	if !s.alive.Load() {
 		return false
@@ -389,7 +390,7 @@ func (s *acpSession) SetLiveModel(model string) bool {
 	if _, err := s.tr.call(s.ctx, "session/set_config_option", map[string]any{
 		"sessionId": sid,
 		"configId":  "model",
-		"value":     map[string]any{"value": model},
+		"value":     model,
 	}); err != nil {
 		slog.Warn("acp: session/set_config_option model failed",
 			"model", model,
@@ -414,7 +415,7 @@ func (s *acpSession) SetLiveReasoningEffort(effort string) bool {
 	if _, err := s.tr.call(s.ctx, "session/set_config_option", map[string]any{
 		"sessionId": sid,
 		"configId":  "reasoning_effort",
-		"value":     map[string]any{"value": effort},
+		"value":     effort,
 	}); err != nil {
 		slog.Warn("acp: session/set_config_option reasoning_effort failed",
 			"reasoning_effort", effort,

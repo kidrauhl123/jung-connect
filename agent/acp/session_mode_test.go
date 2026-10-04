@@ -495,3 +495,39 @@ func TestSession_maybeAbsorbCurrentModeUpdate(t *testing.T) {
 		t.Fatalf("callback should have been fired with currentModeId=plan, got %+v ok=%v", last, ok)
 	}
 }
+
+func TestSession_SetLiveModel_sendsPlainStringValue(t *testing.T) {
+	s, wResp, rReq := newTestSession(t, nil)
+	done := make(chan string, 1)
+	go func() {
+		sc := bufio.NewScanner(rReq)
+		for sc.Scan() {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+				Params map[string]any  `json:"params"`
+			}
+			if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
+				continue
+			}
+			if req.Method != "session/set_config_option" {
+				continue
+			}
+			raw, _ := json.Marshal(req.Params["value"])
+			_, _ = fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":{}}`+"\n", req.ID)
+			done <- string(raw)
+			return
+		}
+	}()
+	if !s.SetLiveModel("grok-4.6-xhigh") {
+		t.Fatal("SetLiveModel returned false")
+	}
+	select {
+	case raw := <-done:
+		if raw != `"grok-4.6-xhigh"` {
+			t.Fatalf("value JSON = %s, want plain string", raw)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for set_config_option")
+	}
+}

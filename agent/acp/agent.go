@@ -269,6 +269,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	a.mu.RUnlock()
 
 	allArgs = injectModelArgs(allArgs, pendingModel)
+	allArgs = injectReasoningEffortArgs(allArgs, pendingEffort)
 
 	return newACPSession(ctx, acpSessionConfig{
 		command:         command,
@@ -538,6 +539,31 @@ func injectModelArgs(args []string, model string) []string {
 	}
 	if !inserted {
 		out = append(out, "-m", model)
+	}
+	return out
+}
+
+// injectReasoningEffortArgs inserts `--reasoning-effort <effort>`
+// before a trailing `stdio` arg (or at the end). Live
+// session/set_config_option can still fail when the current model
+// does not advertise that option, so the spawn flag is the reliable
+// default for new sessions.
+func injectReasoningEffortArgs(args []string, effort string) []string {
+	effort = normalizeReasoningEffort(effort)
+	if effort == "" {
+		return append([]string(nil), args...)
+	}
+	out := make([]string, 0, len(args)+2)
+	inserted := false
+	for _, a := range args {
+		if !inserted && a == "stdio" {
+			out = append(out, "--reasoning-effort", effort)
+			inserted = true
+		}
+		out = append(out, a)
+	}
+	if !inserted {
+		out = append(out, "--reasoning-effort", effort)
 	}
 	return out
 }
