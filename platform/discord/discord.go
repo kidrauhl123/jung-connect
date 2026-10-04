@@ -845,28 +845,26 @@ func resolveCronReplyTarget(sessionKey, title string, ops discordThreadOps) (str
 	if err != nil {
 		return "", replyContext{}, fmt.Errorf("resolve channel %s: %w", channelID, err)
 	}
-	parentChannelID := channelID
-	parentType := ch.Type
+
+	// Already a thread/sub-post: deliver back there. Opening a sibling
+	// thread under the parent posts a "thread created" system message in
+	// the parent channel and leaves the original sub-post silent.
 	if isThreadChannelType(ch.Type) {
-		if ch.ParentID == "" {
-			return "", replyContext{}, core.ErrNotSupported
+		if err := ops.JoinThread(channelID); err != nil {
+			slog.Debug("discord: join existing cron thread failed", "thread", channelID, "error", err)
 		}
-		parent, err := ops.ResolveChannel(ch.ParentID)
-		if err != nil {
-			return "", replyContext{}, fmt.Errorf("resolve parent channel %s: %w", ch.ParentID, err)
-		}
-		parentChannelID = ch.ParentID
-		parentType = parent.Type
+		rc := replyContext{channelID: channelID, threadID: channelID}
+		return sessionKey, rc, nil
 	}
 
-	threadType, ok := standaloneThreadType(parentType)
+	threadType, ok := standaloneThreadType(ch.Type)
 	if !ok {
 		return "", replyContext{}, core.ErrNotSupported
 	}
 
-	thread, err := ops.StartStandaloneThread(parentChannelID, freshThreadName(title), threadType, 1440)
+	thread, err := ops.StartStandaloneThread(channelID, freshThreadName(title), threadType, 1440)
 	if err != nil {
-		return "", replyContext{}, fmt.Errorf("start thread in channel %s: %w", parentChannelID, err)
+		return "", replyContext{}, fmt.Errorf("start thread in channel %s: %w", channelID, err)
 	}
 	if err := ops.JoinThread(thread.ID); err != nil {
 		slog.Debug("discord: join fresh thread failed", "thread", thread.ID, "error", err)
@@ -874,6 +872,19 @@ func resolveCronReplyTarget(sessionKey, title string, ops discordThreadOps) (str
 
 	rc := replyContext{channelID: thread.ID, threadID: thread.ID}
 	return buildThreadSessionKey(thread.ID), rc, nil
+}
+
+// isDiscordConversationalMessageType matches Hermes Discord admission:
+// only default and reply messages become model turns. Channel/thread
+// renames (type 4), pins, joins, and "thread created" system messages
+// must not wake the agent.
+func isDiscordConversationalMessageType(t discordgo.MessageType) bool {
+	switch t {
+	case discordgo.MessageTypeDefault, discordgo.MessageTypeReply:
+		return true
+	default:
+		return false
+	}
 }
 
 // RegisterCommands registers bot commands with Discord for the slash command menu.
@@ -1026,6 +1037,10 @@ func (p *Platform) buildSession() (*discordgo.Session, error) {
 			if m.Author.ID == p.botID && m.GuildID != "" {
 				p.recordThreadParticipation(m.ChannelID, "", sessionThreadOps{session: p.session})
 			}
+			return
+		}
+		if !isDiscordConversationalMessageType(m.Type) {
+			slog.Debug("discord: ignoring non-conversational message", "msg_id", m.ID, "type", m.Type)
 			return
 		}
 		if core.IsOldMessage(m.Timestamp) {
@@ -1403,7 +1418,7 @@ func (p *Platform) sendInteraction(ictx *interactionReplyCtx, content string) er
 	if ictx != nil {
 		p.recordKnownThreadParticipation(ictx.channelID, "")
 	}
-	chunks := core.SplitMessageCodeFenceAware(wrapTablesInCodeBlocks(content), maxDiscordLen)
+	chunks := core.SplitMessageCodeFenceAware(convertTablesToBullets(content), maxDiscordLen)
 	for _, chunk := range chunks {
 		ictx.mu.Lock()
 		first := !ictx.firstDone
@@ -1454,7 +1469,7 @@ func (p *Platform) sendChannel(rc replyContext, content string) error {
 // the send target (the thread), not the parent that owns the starter.
 func (p *Platform) sendChannelMessages(rc replyContext, content string) error {
 	p.recordKnownThreadParticipation(rc.targetChannelID(), rc.threadID)
-	chunks := core.SplitMessageCodeFenceAware(wrapTablesInCodeBlocks(content), maxDiscordLen)
+	chunks := core.SplitMessageCodeFenceAware(convertTablesToBullets(content), maxDiscordLen)
 	mode := p.effectiveReplyToMode()
 	for i, chunk := range chunks {
 		ref := rc.referenceForChunk(mode, i)

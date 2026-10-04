@@ -1,84 +1,109 @@
 package discord
 
-import "strings"
+import (
+	"fmt"
+	"regexp"
+	"strings"
+)
 
-// wrapTablesInCodeBlocks detects markdown tables (contiguous pipe-delimited
-// lines that include a separator row like |---|---|) outside code blocks, and
-// wraps them with ``` so Discord renders them in monospace.
-func wrapTablesInCodeBlocks(s string) string {
-	lines := strings.Split(s, "\n")
-	var result []string
-	inCodeBlock := false
+// Discord does not render GFM pipe tables. Hermes rewrites them at send
+// time into bold headings + bullets (convert_table_to_bullets). jung-connect
+// matches that on the outbound path; the model is not told to avoid tables.
 
+var tableSeparatorRe = regexp.MustCompile(`^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*){1,}\|?\s*$`)
+
+func convertTablesToBullets(text string) string {
+	if !strings.Contains(text, "|") || !strings.Contains(text, "-") {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines))
+	inFence := false
 	i := 0
 	for i < len(lines) {
-		trimmed := strings.TrimSpace(lines[i])
-
-		if strings.HasPrefix(trimmed, "```") {
-			inCodeBlock = !inCodeBlock
-			result = append(result, lines[i])
-			i++
-			continue
+		line := lines[i]
+		isFence := strings.HasPrefix(strings.TrimLeft(line, " \t"), "```")
+		if isFence {
+			inFence = !inFence
 		}
-
-		if inCodeBlock {
-			result = append(result, lines[i])
-			i++
-			continue
-		}
-
-		if isPipeRow(trimmed) {
-			tableStart := i
-			for i < len(lines) {
-				t := strings.TrimSpace(lines[i])
-				if !isPipeRow(t) {
-					break
-				}
-				i++
+		if !inFence && !isFence && strings.Contains(line, "|") && i+1 < len(lines) && tableSeparatorRe.MatchString(lines[i+1]) {
+			j := i + 2
+			for j < len(lines) && isTableRow(lines[j]) {
+				j++
 			}
-			tableLines := lines[tableStart:i]
-			if hasTableSeparator(tableLines) {
-				result = append(result, "```")
-				result = append(result, tableLines...)
-				result = append(result, "```")
-			} else {
-				result = append(result, tableLines...)
-			}
+			out = append(out, renderTableBlock(lines[i:j]))
+			i = j
 			continue
 		}
-
-		result = append(result, lines[i])
+		out = append(out, line)
 		i++
 	}
-
-	return strings.Join(result, "\n")
+	return strings.Join(out, "\n")
 }
 
-func isPipeRow(trimmed string) bool {
-	return len(trimmed) >= 3 &&
-		strings.HasPrefix(trimmed, "|") &&
-		strings.HasSuffix(trimmed, "|")
+func isTableRow(line string) bool {
+	return strings.Contains(strings.TrimSpace(line), "|")
 }
 
-// hasTableSeparator checks if any line in the block looks like | --- | --- |.
-func hasTableSeparator(lines []string) bool {
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		inner := strings.Trim(trimmed, "|")
-		cells := strings.Split(inner, "|")
-		allDash := true
-		for _, cell := range cells {
-			c := strings.TrimSpace(cell)
-			c = strings.TrimLeft(c, ":")
-			c = strings.TrimRight(c, ":")
-			if len(c) == 0 || strings.Trim(c, "-") != "" {
-				allDash = false
-				break
+func splitTableRow(line string) []string {
+	s := strings.TrimSpace(line)
+	s = strings.TrimPrefix(s, "|")
+	s = strings.TrimSuffix(s, "|")
+	parts := strings.Split(s, "|")
+	out := make([]string, len(parts))
+	for i, p := range parts {
+		out[i] = strings.TrimSpace(p)
+	}
+	return out
+}
+
+func renderTableBlock(tableBlock []string) string {
+	if len(tableBlock) < 3 {
+		return strings.Join(tableBlock, "\n")
+	}
+	headers := splitTableRow(tableBlock[0])
+	if len(headers) < 2 {
+		return strings.Join(tableBlock, "\n")
+	}
+	hasRowLabelCol := len(splitTableRow(tableBlock[2])) == len(headers)+1
+	var groups []string
+	for index, row := range tableBlock[2:] {
+		cells := splitTableRow(row)
+		var heading string
+		var data []string
+		if hasRowLabelCol {
+			if len(cells) > 0 && cells[0] != "" {
+				heading = cells[0]
+			} else {
+				heading = fmt.Sprintf("Row %d", index+1)
+			}
+			if len(cells) > 1 {
+				data = cells[1:]
+			}
+		} else {
+			heading = fmt.Sprintf("Row %d", index+1)
+			for _, cell := range cells {
+				if cell != "" {
+					heading = cell
+					break
+				}
+			}
+			data = cells
+		}
+		padded := make([]string, len(headers))
+		copy(padded, data)
+		var bullets []string
+		for i, header := range headers {
+			value := padded[i]
+			if hasRowLabelCol || value != heading {
+				bullets = append(bullets, "• "+header+": "+value)
 			}
 		}
-		if allDash && len(cells) >= 1 {
-			return true
+		group := "**" + heading + "**"
+		if len(bullets) > 0 {
+			group += "\n" + strings.Join(bullets, "\n")
 		}
+		groups = append(groups, group)
 	}
-	return false
+	return strings.Join(groups, "\n\n")
 }

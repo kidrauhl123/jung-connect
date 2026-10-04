@@ -117,12 +117,13 @@ token = "MTk4NjIyNDgzNDcOTY3NDUxMg.G8vKqh.xxx..."
 ```
 
 > cc-connect automatically configures the required Intents (MESSAGE_CONTENT, GUILD_MESSAGES, DIRECT_MESSAGES).
-> With `thread_isolation = true`, cc-connect creates or reuses a Discord thread for each session and routes follow-up messages by thread channel ID.
+> With `thread_isolation = true`, cc-connect creates or reuses a Discord thread for each session and routes follow-up messages by thread channel ID. Timer/cron jobs set **inside a thread** deliver back to **that same thread**. They do not open a sibling thread under the parent channel. Jobs set in a parent text channel still get a fresh standalone thread so the parent timeline is not spammed.
 > After **this bot** has participated in a thread (it opened the thread, or it replied there once), follow-ups in **that thread** do not need another `@mention`. This is independent of `multi-workspace` and is **not** `group_reply_all` — parent text channels stay mention-gated. Set `thread_require_mention = true` if several bots share one thread and each should fire only on `@mention`.
 > Threads this bot **just created** start with a placeholder name (the user's first message, mentions stripped). After the first agent turn, if Claude/Antigravity produces an LLM session title, jung-connect renames that thread — only while Discord still shows the placeholder. A human rename, a forum post the bot did not create, or a later title update is left alone.
 > `progress_style = "compact"` merges thinking/tool updates into one editable message; `progress_style = "card"` renders a Discord-native embed progress card and still sends the final answer as a normal message.
 > Progress light (default on, `reactions = true`): 👀 while working, ✅ on success, ❌ on failure. Cancel only removes 👀. The bot never reads reactions you add.
 > `reply_to_mode` (default `first`): the first chunk of each **final Send** is a Discord reply to your message, including inside `thread_isolation` threads. Progress/preview (`SendPreviewStart`) never replies — Hermes does not thread commentary. The reply's `channel_id` is the **thread** (the send target), not the parent that owns the starter — Discord rejects `REPLIES_CANNOT_REFERENCE_OTHER_CHANNEL` otherwise, and the answer never lands. Later chunks in that send are not replies. `off` never replies; `all` replies on every chunk. A rejected reference (deleted target, system message, or cross-channel) is retried without the reply.
+> Discord does not render GFM pipe tables. Outbound `Send` rewrites them into bold headings + bullets (Hermes `convert_table_to_bullets`). The model is not told to avoid markdown tables.
 
 ---
 
@@ -303,6 +304,14 @@ Existing threads are not backfilled: after a deploy, @ once (or send a slash com
 The bot puts them on **your** message as a progress light (Hermes-style). 👀 while it works, ✅ when the turn succeeds, ❌ if it fails. Cancel only removes 👀. The bot does **not** read reactions you add. Needs the Add Reactions permission; set `reactions = false` to turn this off.
 
 `reply_to_mode` (default `first`) controls Discord "reply" on the **final answer**: the first chunk of each Send references your message — including inside a `thread_isolation` thread, with the reference channel set to the thread (not the parent). Progress/preview messages do not reply. Later chunks in that send do not. `off` never replies; `all` replies on every chunk. If Discord rejects the reference, the chunk is sent again without it.
+
+### Q: Where do /timer and /cron replies go?
+
+Back to the conversation that created the job. A job set in a thread/sub-post stays in that thread. A job set in a parent text channel (with `thread_isolation`) still opens one standalone thread for that run, instead of posting on the parent timeline.
+
+### Q: Does renaming a channel or thread wake the model?
+
+No. Discord's "name changed to …" system message is not a user turn (same as Hermes). Archive/slowmode/tag updates are also ignored. Only normal messages and replies become model turns.
 
 ### Q: Does the bot rename Discord threads?
 

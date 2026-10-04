@@ -358,7 +358,8 @@ func TestResolveCronReplyTarget_ReusesExistingThreadKey(t *testing.T) {
 			case "thread-1":
 				return &discordgo.Channel{ID: "thread-1", Type: discordgo.ChannelTypeGuildPublicThread, ParentID: "channel-1"}, nil
 			case "channel-1":
-				return &discordgo.Channel{ID: "channel-1", Type: discordgo.ChannelTypeGuildText}, nil
+				t.Fatalf("parent channel should not be resolved when origin is already a thread")
+				return nil, nil
 			default:
 				t.Fatalf("unexpected channel lookup %q", channelID)
 				return nil, nil
@@ -366,24 +367,77 @@ func TestResolveCronReplyTarget_ReusesExistingThreadKey(t *testing.T) {
 		},
 	}
 
-	startChannelID := ""
+	joinedThread := ""
+	ops.joinThread = func(threadID string) error {
+		joinedThread = threadID
+		return nil
+	}
 	ops.startStandaloneThread = func(channelID, name string, typ discordgo.ChannelType, archiveDuration int) (*discordgo.Channel, error) {
-		startChannelID = channelID
-		return &discordgo.Channel{ID: "thread-fresh-2", Type: discordgo.ChannelTypeGuildPublicThread}, nil
+		t.Fatalf("StartStandaloneThread(%q) must not run for an existing thread", channelID)
+		return nil, nil
 	}
 
 	sessionKey, rc, err := resolveCronReplyTarget("discord:thread-1", "cron", ops)
 	if err != nil {
 		t.Fatalf("resolveCronReplyTarget() error = %v", err)
 	}
-	if sessionKey != "discord:thread-fresh-2" {
-		t.Fatalf("sessionKey = %q, want discord:thread-fresh-2", sessionKey)
+	if sessionKey != "discord:thread-1" {
+		t.Fatalf("sessionKey = %q, want discord:thread-1", sessionKey)
 	}
-	if rc.threadID != "thread-fresh-2" {
-		t.Fatalf("replyContext = %#v, want thread-fresh-2", rc)
+	if rc.channelID != "thread-1" || rc.threadID != "thread-1" {
+		t.Fatalf("replyContext = %#v, want original thread", rc)
 	}
-	if startChannelID != "channel-1" {
-		t.Fatalf("startChannelID = %q, want channel-1", startChannelID)
+	if joinedThread != "thread-1" {
+		t.Fatalf("joinedThread = %q, want thread-1", joinedThread)
+	}
+}
+
+func TestResolveCronReplyTarget_ReusesThreadUserSessionKey(t *testing.T) {
+	ops := fakeThreadOps{
+		resolveChannel: func(channelID string) (*discordgo.Channel, error) {
+			if channelID != "thread-9" {
+				t.Fatalf("unexpected channel lookup %q", channelID)
+			}
+			return &discordgo.Channel{ID: "thread-9", Type: discordgo.ChannelTypeGuildPublicThread, ParentID: "channel-1"}, nil
+		},
+		startStandaloneThread: func(channelID, name string, typ discordgo.ChannelType, archiveDuration int) (*discordgo.Channel, error) {
+			t.Fatalf("StartStandaloneThread(%q) must not run for a thread-scoped user session", channelID)
+			return nil, nil
+		},
+	}
+
+	sessionKey, rc, err := resolveCronReplyTarget("discord:thread-9:user-1", "timer", ops)
+	if err != nil {
+		t.Fatalf("resolveCronReplyTarget() error = %v", err)
+	}
+	if sessionKey != "discord:thread-9:user-1" {
+		t.Fatalf("sessionKey = %q, want original user session key", sessionKey)
+	}
+	if rc.threadID != "thread-9" {
+		t.Fatalf("replyContext = %#v, want thread-9", rc)
+	}
+}
+
+func TestIsDiscordConversationalMessageType(t *testing.T) {
+	if !isDiscordConversationalMessageType(discordgo.MessageTypeDefault) {
+		t.Fatal("default messages must reach the model")
+	}
+	if !isDiscordConversationalMessageType(discordgo.MessageTypeReply) {
+		t.Fatal("reply messages must reach the model")
+	}
+	nonConversational := []discordgo.MessageType{
+		discordgo.MessageTypeChannelNameChange,
+		discordgo.MessageTypeChannelIconChange,
+		discordgo.MessageTypeChannelPinnedMessage,
+		discordgo.MessageTypeGuildMemberJoin,
+		discordgo.MessageTypeThreadCreated,
+		discordgo.MessageTypeThreadStarterMessage,
+		discordgo.MessageTypeChatInputCommand,
+	}
+	for _, typ := range nonConversational {
+		if isDiscordConversationalMessageType(typ) {
+			t.Fatalf("message type %v must not wake the model", typ)
+		}
 	}
 }
 
