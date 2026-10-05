@@ -309,6 +309,12 @@ The bot puts them on **your** message as a progress light (Hermes-style). 👀 w
 
 Back to the conversation that created the job. A job set in a thread/sub-post stays in that thread. A job set in a parent text channel (with `thread_isolation`) still opens one standalone thread for that run, instead of posting on the parent timeline.
 
+### Q: What does `/fork` do?
+
+Claude Code only. It copies the current conversation and you keep talking on the copy. With `thread_isolation = true` in a guild text channel or an existing thread, jung-connect opens a **sibling** thread under the parent channel: the original thread keeps the original session, the new thread is the copy. DMs, forum posts, and bots without `thread_isolation` stay in place (`--here`): this chat switches to the copy and the original stays in `/list`.
+
+The copy is not started until you send the next message in the new thread (or in this chat, for `--here`). That start uses Claude `--resume <id> --fork-session`, so the two chats do not share one live transcript.
+
 ### Q: Does renaming a channel or thread wake the model?
 
 No. Discord's "name changed to …" system message is not a user turn (same as Hermes). Archive/slowmode/tag updates are also ignored. Only normal messages and replies become model turns.

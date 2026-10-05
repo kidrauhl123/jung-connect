@@ -226,7 +226,23 @@ func buildAppendSystemPrompt(agentPrompt, platformPrompt, userAppend string) str
 	return strings.Join(parts, "\n")
 }
 
-func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs []string, cmdArgsFlag string, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt string, allowedTools, disallowedTools []string, pluginDirs []string, extraEnv []string, platformPrompt string, disableVerbose bool, spawnOpts core.SpawnOptions, maxContextTokens int, ccDataDir string, lang core.Language) (*claudeSession, error) {
+// claudeResumeFlags returns --resume / --fork-session CLI args.
+// An empty or continue sentinel session starts fresh (no flags).
+// fork is only added together with --resume of a real session id.
+func claudeResumeFlags(sessionID string, fork bool) []string {
+	switch sessionID {
+	case "", core.ContinueSession:
+		return nil
+	default:
+		args := []string{"--resume", sessionID}
+		if fork {
+			args = append(args, "--fork-session")
+		}
+		return args
+	}
+}
+
+func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs []string, cmdArgsFlag string, model, effort, sessionID string, fork bool, mode, systemPrompt, appendSystemPrompt string, allowedTools, disallowedTools []string, pluginDirs []string, extraEnv []string, platformPrompt string, disableVerbose bool, spawnOpts core.SpawnOptions, maxContextTokens int, ccDataDir string, lang core.Language) (*claudeSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	// Claude Code rejects bypassPermissions when running as root.
@@ -261,14 +277,7 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 	if mode != "" && mode != "default" {
 		innerArgs = append(innerArgs, "--permission-mode", mode)
 	}
-	switch sessionID {
-	case "", core.ContinueSession:
-		// Truly fresh session — no resume, no continue.
-	default:
-		// Resuming a known session ID — this is cc-connect's own session
-		// from a previous connection, safe to resume directly.
-		innerArgs = append(innerArgs, "--resume", sessionID)
-	}
+	innerArgs = append(innerArgs, claudeResumeFlags(sessionID, fork)...)
 	if len(allowedTools) > 0 {
 		innerArgs = append(innerArgs, "--allowedTools", strings.Join(allowedTools, ","))
 	}

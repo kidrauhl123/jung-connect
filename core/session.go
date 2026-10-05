@@ -25,11 +25,11 @@ const ExplicitActivationTTL = 7 * 24 * time.Hour
 
 // Session tracks one conversation between a user and the agent.
 type Session struct {
-	ID                  string         `json:"id"`
-	Name                string         `json:"name"`
-	AgentSessionID      string         `json:"agent_session_id"`
-	AgentType           string         `json:"agent_type,omitempty"`
-	PastAgentSessionIDs []string       `json:"past_agent_session_ids,omitempty"`
+	ID                  string   `json:"id"`
+	Name                string   `json:"name"`
+	AgentSessionID      string   `json:"agent_session_id"`
+	AgentType           string   `json:"agent_type,omitempty"`
+	PastAgentSessionIDs []string `json:"past_agent_session_ids,omitempty"`
 	// ActiveProvider is the agent provider name that was active when this
 	// session last took a turn. It is restored before --resume so that a
 	// cc-connect process restart does not silently drop a user's
@@ -38,8 +38,12 @@ type Session struct {
 	// — use whatever the agent's default is".
 	ActiveProvider string         `json:"active_provider,omitempty"`
 	History        []HistoryEntry `json:"history"`
-	CreatedAt      time.Time      `json:"created_at"`
-	UpdatedAt      time.Time      `json:"updated_at"`
+	// ForkPending is set by /fork. The next StartSession for this session
+	// must pass Claude --resume <id> --fork-session so the sibling chat
+	// gets a copy instead of attaching to the original transcript.
+	ForkPending bool      `json:"fork_pending,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 	// LastUserActivity records when a real user message was last received.
 	// Unlike UpdatedAt (bumped by every session.Unlock including heartbeats and
 	// unsolicited agent output), this field is only updated when the engine
@@ -223,6 +227,32 @@ func (s *Session) GetActiveProvider() string {
 	return s.ActiveProvider
 }
 
+// IsForkPending reports whether the next StartSession must fork the
+// copied Claude transcript instead of attaching to it.
+func (s *Session) IsForkPending() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ForkPending
+}
+
+// ConsumeForkPending atomically clears the /fork flag. True means the
+// caller must start with --resume <id> --fork-session.
+func (s *Session) ConsumeForkPending() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.ForkPending {
+		return false
+	}
+	s.ForkPending = false
+	return true
+}
+
 // SetAgentSessionID atomically sets the agent session ID and agent type.
 // The ContinueSession sentinel is never persisted — it is only used transiently
 // when starting an agent (see engine); storing it on disk breaks resume (#255).
@@ -401,6 +431,45 @@ func (sm *SessionManager) NewSideSession(userKey, name string) *Session {
 	sm.userSessions[userKey] = append(sm.userSessions[userKey], id)
 	sm.saveLocked()
 	return s
+}
+
+// CloneSessionToKey copies src onto destKey as a new active session without
+// changing srcKey's active session. Used by /fork so the sibling Discord
+// thread (or --here target) starts from the same Claude session id and
+// visible history. AgentSessionID is copied so the next StartSession can
+// pass --resume + --fork-session; the live process then reports a new id.
+func (sm *SessionManager) CloneSessionToKey(src *Session, destKey, name string) *Session {
+	if src == nil || destKey == "" {
+		return nil
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	src.mu.Lock()
+	agentSID := src.AgentSessionID
+	if agentSID == ContinueSession {
+		agentSID = ""
+	}
+	clone := &Session{
+		ID:                  sm.nextID(),
+		Name:                name,
+		AgentSessionID:      agentSID,
+		AgentType:           src.AgentType,
+		PastAgentSessionIDs: append([]string(nil), src.PastAgentSessionIDs...),
+		ActiveProvider:      src.ActiveProvider,
+		History:             append([]HistoryEntry(nil), src.History...),
+		ForkPending:         agentSID != "",
+		CreatedAt:           time.Now(),
+		UpdatedAt:           time.Now(),
+	}
+	src.mu.Unlock()
+
+	sm.sessions[clone.ID] = clone
+	sm.activeSession[destKey] = clone.ID
+	sm.userSessions[destKey] = append(sm.userSessions[destKey], clone.ID)
+	clone.markExplicitlyActivatedLocked()
+	sm.saveLocked()
+	return clone
 }
 
 func (sm *SessionManager) createLocked(userKey, name string) *Session {
@@ -685,7 +754,9 @@ func (sm *SessionManager) saveLocked() {
 			AgentSessionID:      agentSID,
 			AgentType:           s.AgentType,
 			PastAgentSessionIDs: append([]string(nil), s.PastAgentSessionIDs...),
+			ActiveProvider:      s.ActiveProvider,
 			History:             append([]HistoryEntry(nil), s.History...),
+			ForkPending:         s.ForkPending,
 			CreatedAt:           s.CreatedAt,
 			UpdatedAt:           s.UpdatedAt,
 			LastUserActivity:    s.LastUserActivity,
@@ -876,7 +947,7 @@ func (sm *SessionManager) PruneDuplicateSessions(mergeHistory bool) PruneResult 
 	defer sm.mu.Unlock()
 
 	// Group sessions by baseChat
-	chatSessions := make(map[string][]*Session) // baseChat -> sessions
+	chatSessions := make(map[string][]*Session)  // baseChat -> sessions
 	sessionToBaseChat := make(map[string]string) // session.ID -> baseChat
 
 	for userKey, sessionIDs := range sm.userSessions {

@@ -874,6 +874,59 @@ func resolveCronReplyTarget(sessionKey, title string, ops discordThreadOps) (str
 	return buildThreadSessionKey(thread.ID), rc, nil
 }
 
+// resolveForkReplyTarget opens a sibling Discord thread for /fork.
+// Unlike cron (which stays in an existing thread), /fork always creates a
+// new standalone thread under the parent guild channel so the original
+// conversation is left untouched. DMs, forums, and other non-threadable
+// parents return ErrNotSupported so the engine can fall back to --here.
+func resolveForkReplyTarget(sessionKey, title string, origin replyContext, ops discordThreadOps) (string, replyContext, error) {
+	channelID, err := parseDiscordSessionKeyChannelID(sessionKey)
+	if err != nil {
+		if origin.threadID != "" {
+			channelID = origin.threadID
+		} else if origin.channelID != "" {
+			channelID = origin.channelID
+		} else {
+			return "", replyContext{}, err
+		}
+	}
+
+	ch, err := ops.ResolveChannel(channelID)
+	if err != nil {
+		return "", replyContext{}, fmt.Errorf("resolve channel %s: %w", channelID, err)
+	}
+
+	parentID := channelID
+	parentType := ch.Type
+	if isThreadChannelType(ch.Type) {
+		if ch.ParentID == "" {
+			return "", replyContext{}, core.ErrNotSupported
+		}
+		parent, err := ops.ResolveChannel(ch.ParentID)
+		if err != nil {
+			return "", replyContext{}, fmt.Errorf("resolve parent %s: %w", ch.ParentID, err)
+		}
+		parentID = parent.ID
+		parentType = parent.Type
+	}
+
+	threadType, ok := standaloneThreadType(parentType)
+	if !ok {
+		return "", replyContext{}, core.ErrNotSupported
+	}
+
+	thread, err := ops.StartStandaloneThread(parentID, freshThreadName(title), threadType, 1440)
+	if err != nil {
+		return "", replyContext{}, fmt.Errorf("start fork thread in channel %s: %w", parentID, err)
+	}
+	if err := ops.JoinThread(thread.ID); err != nil {
+		slog.Debug("discord: join fork thread failed", "thread", thread.ID, "error", err)
+	}
+
+	rc := replyContext{channelID: thread.ID, threadID: thread.ID}
+	return buildThreadSessionKey(thread.ID), rc, nil
+}
+
 // isDiscordConversationalMessageType matches Hermes Discord admission:
 // only default and reply messages become model turns. Channel/thread
 // renames (type 4), pins, joins, and "thread created" system messages
@@ -1707,6 +1760,26 @@ func (p *Platform) ResolveCronReplyTarget(sessionKey string, title string) (stri
 		return "", nil, core.ErrNotSupported
 	}
 	resolvedSessionKey, rc, err := resolveCronReplyTarget(sessionKey, title, sessionThreadOps{session: p.session})
+	if err != nil {
+		return "", nil, err
+	}
+	return resolvedSessionKey, rc, nil
+}
+
+func (p *Platform) ResolveForkReplyTarget(sessionKey string, title string, replyCtx any) (string, any, error) {
+	if !p.threadIsolation {
+		return "", nil, core.ErrNotSupported
+	}
+	var origin replyContext
+	switch rc := replyCtx.(type) {
+	case replyContext:
+		origin = rc
+	case *interactionReplyCtx:
+		if rc != nil {
+			origin = replyContext{channelID: rc.channelID}
+		}
+	}
+	resolvedSessionKey, rc, err := resolveForkReplyTarget(sessionKey, title, origin, sessionThreadOps{session: p.session})
 	if err != nil {
 		return "", nil, err
 	}

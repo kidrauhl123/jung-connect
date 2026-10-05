@@ -15840,6 +15840,235 @@ func TestBtwAlias_ResolvesToPs(t *testing.T) {
 	}
 }
 
+// TestForkCommand_ResolvesAsBuiltin is the first /fork tracer: the slash
+// must resolve to a builtin id, not fall through as an unknown command
+// that gets forwarded to the agent.
+func TestForkCommand_ResolvesAsBuiltin(t *testing.T) {
+	id := matchPrefix("fork", builtinCommands)
+	if id != "fork" {
+		t.Fatalf("matchPrefix(\"fork\") = %q, want \"fork\"", id)
+	}
+}
+
+type forkableAgent struct {
+	startCalls []string
+	forkCalls  []string
+}
+
+func (a *forkableAgent) Name() string { return "forkable" }
+func (a *forkableAgent) StartSession(_ context.Context, sessionID string) (AgentSession, error) {
+	a.startCalls = append(a.startCalls, sessionID)
+	return newControllableSession("live"), nil
+}
+func (a *forkableAgent) StartForkedSession(_ context.Context, sessionID string) (AgentSession, error) {
+	a.forkCalls = append(a.forkCalls, sessionID)
+	return newControllableSession("forked"), nil
+}
+func (a *forkableAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) { return nil, nil }
+func (a *forkableAgent) Stop() error                                                { return nil }
+
+type stubForkReplyPlatform struct {
+	stubPlatformEngine
+	destKey     string
+	destCtx     any
+	resolveErr  error
+	lastKey     string
+	lastTitle   string
+	replyBodies []string
+	replyCtxs   []any
+}
+
+func (p *stubForkReplyPlatform) ResolveForkReplyTarget(sessionKey string, title string, _ any) (string, any, error) {
+	p.lastKey = sessionKey
+	p.lastTitle = title
+	if p.resolveErr != nil {
+		return "", nil, p.resolveErr
+	}
+	return p.destKey, p.destCtx, nil
+}
+
+func (p *stubForkReplyPlatform) Reply(_ context.Context, replyCtx any, content string) error {
+	p.mu.Lock()
+	p.sent = append(p.sent, content)
+	p.replyBodies = append(p.replyBodies, content)
+	p.replyCtxs = append(p.replyCtxs, replyCtx)
+	p.mu.Unlock()
+	return nil
+}
+
+func TestCmdFork_UnsupportedAgentIsNotForwarded(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	src := e.sessions.GetOrCreateActive("test:u1")
+	src.SetAgentSessionID("sess-1", "stub")
+
+	handled := e.handleCommand(p, &Message{SessionKey: "test:u1", ReplyCtx: "ctx", UserID: "u1", Platform: "test"}, "/fork")
+	if !handled {
+		t.Fatal("/fork must be handled as a builtin, not forwarded to the agent")
+	}
+	sent := p.getSent()
+	if len(sent) == 0 {
+		t.Fatal("expected an error reply")
+	}
+	if !strings.Contains(strings.ToLower(sent[0]), "fork") {
+		t.Fatalf("reply = %q, want a /fork-not-supported message", sent[0])
+	}
+	if e.sessions.ActiveSessionID("test:u1") != src.ID {
+		t.Fatal("unsupported /fork must not change the active session")
+	}
+}
+
+func TestCmdFork_NoSession(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	agent := &forkableAgent{}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	handled := e.handleCommand(p, &Message{SessionKey: "test:u1", ReplyCtx: "ctx", UserID: "u1", Platform: "test"}, "/fork")
+	if !handled {
+		t.Fatal("/fork must be handled")
+	}
+	sent := p.getSent()
+	if len(sent) == 0 {
+		t.Fatal("expected an error reply")
+	}
+	if len(agent.forkCalls)+len(agent.startCalls) != 0 {
+		t.Fatal("/fork must not start an agent process")
+	}
+}
+
+func TestCmdFork_HereClonesOnSameKey(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	agent := &forkableAgent{}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	src := e.sessions.GetOrCreateActive("test:u1")
+	src.SetName("login bug")
+	src.SetAgentSessionID("claude-abc", "claudecode")
+	src.AddHistory("user", "fix the login")
+	srcID := src.ID
+
+	handled := e.handleCommand(p, &Message{SessionKey: "test:u1", ReplyCtx: "ctx", UserID: "u1", Platform: "test"}, "/fork login bug fork")
+	if !handled {
+		t.Fatal("/fork must be handled")
+	}
+	if len(agent.forkCalls)+len(agent.startCalls) != 0 {
+		t.Fatal("/fork must not start an agent process; wait for the next user message")
+	}
+	activeID := e.sessions.ActiveSessionID("test:u1")
+	if activeID == srcID {
+		t.Fatal("--here /fork must switch this key to the clone")
+	}
+	clone := e.sessions.GetOrCreateActive("test:u1")
+	if clone.GetAgentSessionID() != "claude-abc" {
+		t.Fatalf("clone agent id = %q, want claude-abc", clone.GetAgentSessionID())
+	}
+	if clone.GetName() != "login bug fork" {
+		t.Fatalf("clone name = %q", clone.GetName())
+	}
+	if !clone.ConsumeForkPending() {
+		t.Fatal("clone must be ForkPending")
+	}
+	if src.GetAgentSessionID() != "claude-abc" {
+		t.Fatal("original session id must stay on the original record")
+	}
+	var sawSrc bool
+	for _, s := range e.sessions.ListSessions("test:u1") {
+		if s.ID == srcID {
+			sawSrc = true
+		}
+	}
+	if !sawSrc {
+		t.Fatal("original session must remain in /list")
+	}
+	sent := p.getSent()
+	if len(sent) == 0 || !strings.Contains(sent[0], "Forked") {
+		t.Fatalf("user-visible reply = %#v, want a Forked confirmation", sent)
+	}
+}
+
+func TestCmdFork_OpensSiblingWhenPlatformSupports(t *testing.T) {
+	p := &stubForkReplyPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "discord"},
+		destKey:            "discord:thread-fork",
+		destCtx:            "fork-ctx",
+	}
+	agent := &forkableAgent{}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	src := e.sessions.GetOrCreateActive("discord:thread-old")
+	src.SetName("login bug")
+	src.SetAgentSessionID("claude-abc", "claudecode")
+	srcID := src.ID
+
+	handled := e.handleCommand(p, &Message{
+		SessionKey: "discord:thread-old",
+		ReplyCtx:   "orig-ctx",
+		UserID:     "u1",
+		Platform:   "discord",
+	}, "/fork login bug fork")
+	if !handled {
+		t.Fatal("/fork must be handled")
+	}
+	if p.lastKey != "discord:thread-old" {
+		t.Fatalf("ResolveForkReplyTarget sessionKey = %q", p.lastKey)
+	}
+	if p.lastTitle != "login bug fork" {
+		t.Fatalf("ResolveForkReplyTarget title = %q", p.lastTitle)
+	}
+	if e.sessions.ActiveSessionID("discord:thread-old") != srcID {
+		t.Fatal("sibling /fork must leave the original thread on the original session")
+	}
+	clone := e.sessions.GetOrCreateActive("discord:thread-fork")
+	if clone.ID == srcID {
+		t.Fatal("new thread must have its own session")
+	}
+	if clone.GetAgentSessionID() != "claude-abc" {
+		t.Fatalf("clone agent id = %q", clone.GetAgentSessionID())
+	}
+	if !clone.ConsumeForkPending() {
+		t.Fatal("clone must be ForkPending")
+	}
+	if len(agent.forkCalls)+len(agent.startCalls) != 0 {
+		t.Fatal("/fork must not start an agent process")
+	}
+	if len(p.replyCtxs) < 2 {
+		t.Fatalf("expected replies in original and new thread, got %#v", p.replyCtxs)
+	}
+	var sawOrig, sawFork bool
+	for _, ctx := range p.replyCtxs {
+		if ctx == "orig-ctx" {
+			sawOrig = true
+		}
+		if ctx == "fork-ctx" {
+			sawFork = true
+		}
+	}
+	if !sawOrig || !sawFork {
+		t.Fatalf("replies must land in both threads, ctxs=%#v", p.replyCtxs)
+	}
+}
+
+func TestGetOrCreateInteractiveState_ForkPendingUsesStartForkedSession(t *testing.T) {
+	agent := &forkableAgent{}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	session := e.sessions.GetOrCreateActive("test:u1")
+	session.SetAgentSessionID("claude-abc", "claudecode")
+	session.ForkPending = true
+
+	state := e.getOrCreateInteractiveStateWith("test:u1", p, "ctx", session, e.sessions, agent, "")
+	if state == nil || state.agentSession == nil {
+		t.Fatal("expected a started agent session")
+	}
+	if len(agent.forkCalls) != 1 || agent.forkCalls[0] != "claude-abc" {
+		t.Fatalf("StartForkedSession calls = %#v, want [claude-abc]", agent.forkCalls)
+	}
+	if len(agent.startCalls) != 0 {
+		t.Fatalf("StartSession calls = %#v, want none (must fork, not resume)", agent.startCalls)
+	}
+	if session.ConsumeForkPending() {
+		t.Fatal("ForkPending must be consumed so a later resume does not fork again")
+	}
+}
+
 func TestHandlePendingPermission_AskQuestion_EmptyContentRejected(t *testing.T) {
 	// Regression test for #1086: empty or whitespace-only messages must NOT
 	// be accepted as AskUserQuestion answers. Some platforms deliver read-receipts

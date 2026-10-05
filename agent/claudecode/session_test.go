@@ -19,6 +19,29 @@ import (
 	"github.com/chenhg5/cc-connect/core"
 )
 
+func TestClaudeResumeFlags_ForkAddsFlag(t *testing.T) {
+	got := claudeResumeFlags("sess-abc", true)
+	want := []string{"--resume", "sess-abc", "--fork-session"}
+	if len(got) != len(want) {
+		t.Fatalf("claudeResumeFlags = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("claudeResumeFlags = %#v, want %#v", got, want)
+		}
+	}
+}
+
+func TestClaudeResumeFlags_ResumeWithoutFork(t *testing.T) {
+	got := claudeResumeFlags("sess-abc", false)
+	if len(got) != 2 || got[0] != "--resume" || got[1] != "sess-abc" {
+		t.Fatalf("claudeResumeFlags = %#v, want [--resume sess-abc]", got)
+	}
+	if got = claudeResumeFlags("", true); got != nil {
+		t.Fatalf("empty session must not add --fork-session, got %#v", got)
+	}
+}
+
 func TestHandleResultParsesUsage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1228,6 +1251,7 @@ func TestNewClaudeSession_NoReplayFlagKeepsProcessAlive(t *testing.T) {
 		"",                                   // model
 		"",                                   // effort
 		"",                                   // sessionID (truly fresh)
+		false,                                // fork
 		"default",                            // mode
 		"",                                   // systemPrompt
 		"",                                   // appendSystemPrompt

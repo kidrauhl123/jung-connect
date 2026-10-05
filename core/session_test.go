@@ -60,6 +60,88 @@ func TestSessionManager_NewSideSession(t *testing.T) {
 	}
 }
 
+func TestSessionManager_CloneSessionToKey(t *testing.T) {
+	sm := NewSessionManager("")
+	srcKey := "discord:thread-old"
+	dstKey := "discord:thread-new"
+	src := sm.GetOrCreateActive(srcKey)
+	src.SetName("login bug")
+	src.SetAgentSessionID("claude-abc", "claudecode")
+	src.SetActiveProvider("anthropic")
+	src.AddHistory("user", "fix the login")
+	src.AddHistory("assistant", "looking")
+	srcID := src.ID
+
+	clone := sm.CloneSessionToKey(src, dstKey, "login bug fork")
+	if clone == nil {
+		t.Fatal("CloneSessionToKey returned nil")
+	}
+	if clone.ID == srcID {
+		t.Fatal("clone must be a new session record")
+	}
+	if sm.ActiveSessionID(srcKey) != srcID {
+		t.Fatalf("source active session changed: got %q want %q", sm.ActiveSessionID(srcKey), srcID)
+	}
+	if sm.ActiveSessionID(dstKey) != clone.ID {
+		t.Fatalf("dest active = %q, want clone %q", sm.ActiveSessionID(dstKey), clone.ID)
+	}
+	if clone.GetName() != "login bug fork" {
+		t.Fatalf("clone name = %q, want login bug fork", clone.GetName())
+	}
+	if clone.GetAgentSessionID() != "claude-abc" {
+		t.Fatalf("clone agent session id = %q, want claude-abc (copied for --fork-session)", clone.GetAgentSessionID())
+	}
+	if clone.GetActiveProvider() != "anthropic" {
+		t.Fatalf("clone provider = %q, want anthropic", clone.GetActiveProvider())
+	}
+	hist := clone.GetHistory(0)
+	if len(hist) != 2 || hist[0].Content != "fix the login" || hist[1].Content != "looking" {
+		t.Fatalf("clone history = %#v, want copied source history", hist)
+	}
+	src.AddHistory("user", "later on original")
+	if len(clone.GetHistory(0)) != 2 {
+		t.Fatal("mutating source history must not change the clone")
+	}
+	if !clone.ConsumeForkPending() {
+		t.Fatal("clone must be marked ForkPending so the next start uses --fork-session")
+	}
+	if clone.ConsumeForkPending() {
+		t.Fatal("ConsumeForkPending must be one-shot")
+	}
+}
+
+func TestSessionManager_CloneSessionToKey_SameKeySwitchesActive(t *testing.T) {
+	sm := NewSessionManager("")
+	key := "telegram:dm-1"
+	src := sm.GetOrCreateActive(key)
+	src.SetAgentSessionID("claude-abc", "claudecode")
+	srcID := src.ID
+
+	clone := sm.CloneSessionToKey(src, key, "here fork")
+	if clone == nil {
+		t.Fatal("CloneSessionToKey returned nil")
+	}
+	if sm.ActiveSessionID(key) != clone.ID {
+		t.Fatalf("same-key clone should become active, got %q want %q", sm.ActiveSessionID(key), clone.ID)
+	}
+	listed := sm.ListSessions(key)
+	var sawSrc, sawClone bool
+	for _, s := range listed {
+		if s.ID == srcID {
+			sawSrc = true
+		}
+		if s.ID == clone.ID {
+			sawClone = true
+		}
+	}
+	if !sawSrc || !sawClone {
+		t.Fatalf("same-key clone must keep the original in /list (src=%v clone=%v)", sawSrc, sawClone)
+	}
+	if src.GetAgentSessionID() != "claude-abc" {
+		t.Fatalf("original agent session id changed: %q", src.GetAgentSessionID())
+	}
+}
+
 func TestSessionManager_SwitchSession(t *testing.T) {
 	sm := NewSessionManager("")
 	s1 := sm.NewSession("user1", "first")
@@ -1117,4 +1199,3 @@ func TestKnownAgentSessionIDs_ResetAllSessionsBug(t *testing.T) {
 		t.Fatalf("filterOwnedSessions returned %d, want 3", len(filtered))
 	}
 }
-

@@ -4089,6 +4089,20 @@ func (e *Engine) workspaceContext(workspace, sessionKey string) (Agent, *Session
 	return wsAgent, wsSessions, interactiveKey, effectiveDir, nil
 }
 
+// startAgentSession starts or resumes an agent process. When fork is true the
+// agent must copy the existing backend session (Claude --fork-session) instead
+// of attaching to it. Agents that cannot fork fall back to StartSession.
+func startAgentSession(ctx context.Context, agent Agent, sessionID string, fork bool) (AgentSession, error) {
+	if fork {
+		if starter, ok := agent.(SessionForkStarter); ok {
+			return starter.StartForkedSession(ctx, sessionID)
+		}
+		slog.Warn("fork requested but agent does not support StartForkedSession, starting a normal session",
+			"agent", agent.Name(), "session_id", sessionID)
+	}
+	return agent.StartSession(ctx, sessionID)
+}
+
 // getOrCreateInteractiveStateWith accepts an optional agent override for multi-workspace mode.
 // adoptPendingFromPlaceholder copies pendingMessages from an existing placeholder
 // state to newState so queued messages are not lost when the map entry is replaced.
@@ -4130,7 +4144,13 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		// - the process has not reported an ID yet (startup; empty want is OK).
 		// If wantID is empty (/new, cleared session) but the process already has
 		// a concrete ID, reusing would keep --resume context — recycle (#238).
+		// /fork copies the agent session id onto the clone and sets ForkPending;
+		// the live process is still the original transcript, so we must recycle
+		// even when the ids currently match.
 		needRecycle := currentID != "" && (wantID == "" || wantID != currentID)
+		if session.IsForkPending() {
+			needRecycle = true
+		}
 		if !needRecycle {
 			return state
 		}
@@ -4242,8 +4262,12 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	}
 
 	isResume := startSessionID != ""
+	forkPending := session.ConsumeForkPending()
+	if forkPending {
+		sessions.Save()
+	}
 	startAt := time.Now()
-	agentSession, err := agent.StartSession(e.ctx, startSessionID)
+	agentSession, err := startAgentSession(e.ctx, agent, startSessionID, forkPending)
 	startElapsed := time.Since(startAt)
 	if err != nil {
 		// If resume/continue failed, try a fresh session as fallback.
@@ -4256,7 +4280,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 			session.SetAgentSessionID("", agent.Name())
 			sessions.Save()
 			startAt = time.Now()
-			agentSession, err = agent.StartSession(e.ctx, "")
+			agentSession, err = startAgentSession(e.ctx, agent, "", false)
 			startElapsed = time.Since(startAt)
 			if err == nil {
 				slog.Info("fresh session started after resume failure",
@@ -6631,6 +6655,7 @@ var builtinCommands = []struct {
 	id    string
 }{
 	{[]string{"new"}, "new"},
+	{[]string{"fork"}, "fork"},
 	{[]string{"list", "sessions"}, "list"},
 	{[]string{"switch"}, "switch"},
 	{[]string{"name", "rename"}, "name"},
@@ -6831,6 +6856,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 	switch cmdID {
 	case "new":
 		e.cmdNew(p, msg, args)
+	case "fork":
+		e.cmdFork(p, msg, args)
 	case "list":
 		e.cmdList(p, msg, args)
 	case "switch":
@@ -7224,6 +7251,67 @@ func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
 	} else {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNewSessionCreated))
 	}
+}
+
+func (e *Engine) cmdFork(p Platform, msg *Message, args []string) {
+	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return
+	}
+	if _, ok := agent.(SessionForkStarter); !ok {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgForkNotSupported))
+		return
+	}
+
+	src := sessions.GetOrCreateActive(msg.SessionKey)
+	agentSID := src.GetAgentSessionID()
+	if agentSID == "" || agentSID == ContinueSession {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgForkNoSession))
+		return
+	}
+
+	name := strings.TrimSpace(strings.Join(args, " "))
+	if name == "" {
+		if n := src.GetName(); n != "" && n != "default" && n != "session" {
+			name = n + " fork"
+		} else {
+			name = "fork"
+		}
+	}
+
+	destKey := msg.SessionKey
+	destCtx := msg.ReplyCtx
+	openedSibling := false
+	if resolver, ok := p.(ForkReplyTargetResolver); ok {
+		resolvedKey, resolvedCtx, resolveErr := resolver.ResolveForkReplyTarget(msg.SessionKey, name, msg.ReplyCtx)
+		switch {
+		case resolveErr == nil && resolvedKey != "" && resolvedKey != msg.SessionKey:
+			destKey = resolvedKey
+			destCtx = resolvedCtx
+			openedSibling = true
+		case resolveErr != nil && !errors.Is(resolveErr, ErrNotSupported):
+			slog.Warn("fork: sibling target failed, falling back to --here",
+				"session_key", msg.SessionKey, "error", resolveErr)
+		}
+	}
+
+	if sessions.CloneSessionToKey(src, destKey, name) == nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgForkNoSession))
+		return
+	}
+
+	if openedSibling {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgForkOpened))
+		e.reply(p, destCtx, e.i18n.T(MsgForkContinue))
+		return
+	}
+
+	// --here: this key now points at the clone. Drop the live process so the
+	// next user message starts --resume + --fork-session instead of talking
+	// to the original transcript.
+	e.cleanupInteractiveState(interactiveKey)
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgForkHere))
 }
 
 // applySessionFilter conditionally filters agent sessions based on the
@@ -9635,6 +9723,7 @@ func helpCardGroups() []helpCardGroup {
 			titleKey: MsgHelpSessionSection,
 			items: []helpCardItem{
 				{command: "/new", action: "act:/new"},
+				{command: "/fork", action: "cmd:/fork"},
 				{command: "/cancel", action: "cmd:/cancel"},
 				{command: "/list", action: "nav:/list"},
 				{command: "/current", action: "nav:/current"},

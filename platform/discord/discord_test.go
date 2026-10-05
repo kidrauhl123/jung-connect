@@ -418,6 +418,77 @@ func TestResolveCronReplyTarget_ReusesThreadUserSessionKey(t *testing.T) {
 	}
 }
 
+func TestResolveForkReplyTarget_OpensSiblingUnderParent(t *testing.T) {
+	ops := fakeThreadOps{
+		resolveChannel: func(channelID string) (*discordgo.Channel, error) {
+			switch channelID {
+			case "thread-1":
+				return &discordgo.Channel{ID: "thread-1", Type: discordgo.ChannelTypeGuildPublicThread, ParentID: "channel-1"}, nil
+			case "channel-1":
+				return &discordgo.Channel{ID: "channel-1", Type: discordgo.ChannelTypeGuildText}, nil
+			default:
+				t.Fatalf("unexpected channel lookup %q", channelID)
+				return nil, nil
+			}
+		},
+	}
+	var (
+		startChannelID string
+		startName      string
+		startType      discordgo.ChannelType
+		joinedThread   string
+	)
+	ops.startStandaloneThread = func(channelID, name string, typ discordgo.ChannelType, archiveDuration int) (*discordgo.Channel, error) {
+		startChannelID = channelID
+		startName = name
+		startType = typ
+		return &discordgo.Channel{ID: "thread-fork", Type: discordgo.ChannelTypeGuildPublicThread, ParentID: "channel-1"}, nil
+	}
+	ops.joinThread = func(threadID string) error {
+		joinedThread = threadID
+		return nil
+	}
+
+	sessionKey, rc, err := resolveForkReplyTarget("discord:thread-1", "login bug fork", replyContext{channelID: "thread-1", threadID: "thread-1"}, ops)
+	if err != nil {
+		t.Fatalf("resolveForkReplyTarget() error = %v", err)
+	}
+	if sessionKey != "discord:thread-fork" {
+		t.Fatalf("sessionKey = %q, want discord:thread-fork", sessionKey)
+	}
+	if rc.channelID != "thread-fork" || rc.threadID != "thread-fork" {
+		t.Fatalf("replyContext = %#v, want forked thread", rc)
+	}
+	if startChannelID != "channel-1" {
+		t.Fatalf("startChannelID = %q, want parent channel-1", startChannelID)
+	}
+	if startName != "login bug fork" {
+		t.Fatalf("thread name = %q, want login bug fork", startName)
+	}
+	if startType != discordgo.ChannelTypeGuildPublicThread {
+		t.Fatalf("thread type = %v, want public thread", startType)
+	}
+	if joinedThread != "thread-fork" {
+		t.Fatalf("joinedThread = %q, want thread-fork", joinedThread)
+	}
+}
+
+func TestResolveForkReplyTarget_DMIsNotSupported(t *testing.T) {
+	ops := fakeThreadOps{
+		resolveChannel: func(channelID string) (*discordgo.Channel, error) {
+			return &discordgo.Channel{ID: channelID, Type: discordgo.ChannelTypeDM}, nil
+		},
+		startStandaloneThread: func(channelID, name string, typ discordgo.ChannelType, archiveDuration int) (*discordgo.Channel, error) {
+			t.Fatalf("must not open a thread in a DM")
+			return nil, nil
+		},
+	}
+	_, _, err := resolveForkReplyTarget("discord:dm-1:user-1", "fork", replyContext{channelID: "dm-1"}, ops)
+	if err != core.ErrNotSupported {
+		t.Fatalf("error = %v, want ErrNotSupported", err)
+	}
+}
+
 func TestIsDiscordConversationalMessageType(t *testing.T) {
 	if !isDiscordConversationalMessageType(discordgo.MessageTypeDefault) {
 		t.Fatal("default messages must reach the model")

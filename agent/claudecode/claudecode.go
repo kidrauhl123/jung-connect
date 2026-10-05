@@ -476,6 +476,18 @@ func validateSessionIDInProject(homeDir, workDir, sessionID string) bool {
 
 // StartSession creates a persistent interactive Claude Code session.
 func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
+	return a.startSession(ctx, sessionID, false)
+}
+
+// StartForkedSession copies an existing Claude session via --resume <id> --fork-session.
+func (a *Agent) StartForkedSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
+	if sessionID == "" || sessionID == core.ContinueSession {
+		return a.startSession(ctx, "", false)
+	}
+	return a.startSession(ctx, sessionID, true)
+}
+
+func (a *Agent) startSession(ctx context.Context, sessionID string, fork bool) (core.AgentSession, error) {
 	a.mu.Lock()
 	tools := make([]string, len(a.allowedTools))
 	copy(tools, a.allowedTools)
@@ -503,6 +515,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		"activeProvider", activeProviderName,
 		"model", model,
 		"sessionID", sessionID,
+		"fork", fork,
 		"providerCount", len(a.providers))
 	platformPrompt := a.platformPrompt
 	systemPrompt := a.systemPrompt
@@ -516,7 +529,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	disableVerbose := a.routerURL != ""
 	a.mu.Unlock()
 
-	return newClaudeSession(ctx, workDir, a.cmd, a.cliExtraArgs, a.cmdArgsFlag, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt, tools, disTools, pluginDirs, extraEnv, platformPrompt, disableVerbose, a.spawnOpts, maxTok, a.ccDataDir, lang)
+	return newClaudeSession(ctx, workDir, a.cmd, a.cliExtraArgs, a.cmdArgsFlag, model, effort, sessionID, fork, mode, systemPrompt, appendSystemPrompt, tools, disTools, pluginDirs, extraEnv, platformPrompt, disableVerbose, a.spawnOpts, maxTok, a.ccDataDir, lang)
 }
 
 func (a *Agent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, error) {

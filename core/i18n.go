@@ -378,69 +378,69 @@ const (
 	MsgReasoningUsage             MsgKey = "reasoning_usage"
 	MsgReasoningSelectPlaceholder MsgKey = "reasoning_select_placeholder"
 
-	MsgModeUsage                 MsgKey = "mode_usage"
-	MsgLangSelectPlaceholder     MsgKey = "lang_select_placeholder"
-	MsgModelSelectPlaceholder    MsgKey = "model_select_placeholder"
-	MsgModelVendorListTitle      MsgKey = "model_vendor_list_title"
+	MsgModeUsage                    MsgKey = "mode_usage"
+	MsgLangSelectPlaceholder        MsgKey = "lang_select_placeholder"
+	MsgModelSelectPlaceholder       MsgKey = "model_select_placeholder"
+	MsgModelVendorListTitle         MsgKey = "model_vendor_list_title"
 	MsgModelVendorSelectPlaceholder MsgKey = "model_vendor_select_placeholder"
-	MsgModelVendorBack           MsgKey = "model_vendor_back"
-	MsgModeSelectPlaceholder     MsgKey = "mode_select_placeholder"
-	MsgProviderSelectPlaceholder MsgKey = "provider_select_placeholder"
-	MsgProviderClearOption       MsgKey = "provider_clear_option"
-	MsgCardBack                  MsgKey = "card_back"
-	MsgCardPrev                  MsgKey = "card_prev"
-	MsgCardNext                  MsgKey = "card_next"
-	MsgCardTitleStatus           MsgKey = "card_title_status"
-	MsgCardTitleLanguage         MsgKey = "card_title_language"
-	MsgCardTitleModel            MsgKey = "card_title_model"
-	MsgCardTitleReasoning        MsgKey = "card_title_reasoning"
-	MsgCardTitleMode             MsgKey = "card_title_mode"
-	MsgCardTitleSessions         MsgKey = "card_title_sessions"
-	MsgCardTitleSessionsPaged    MsgKey = "card_title_sessions_paged"
-	MsgCardTitleCurrentSession   MsgKey = "card_title_current_session"
-	MsgCardTitleHistory          MsgKey = "card_title_history"
-	MsgCardTitleHistoryLast      MsgKey = "card_title_history_last"
-	MsgCardTitleProvider         MsgKey = "card_title_provider"
-	MsgCardTitleCron             MsgKey = "card_title_cron"
-	MsgCardTitleTimer            MsgKey = "card_title_timer"
-	MsgCardTitleHeartbeat        MsgKey = "card_title_heartbeat"
-	MsgCardTitleCommands         MsgKey = "card_title_commands"
-	MsgCardTitleAlias            MsgKey = "card_title_alias"
-	MsgCardTitleConfig           MsgKey = "card_title_config"
-	MsgCardTitleSkills           MsgKey = "card_title_skills"
-	MsgCardTitleDoctor           MsgKey = "card_title_doctor"
-	MsgCardTitleVersion          MsgKey = "card_title_version"
-	MsgCardTitleUpgrade          MsgKey = "card_title_upgrade"
-	MsgListItem                  MsgKey = "list_item"
-	MsgListEmptySummary          MsgKey = "list_empty_summary"
-	MsgCronIDLabel               MsgKey = "cron_id_label"
-	MsgCronFailedSuffix          MsgKey = "cron_failed_suffix"
+	MsgModelVendorBack              MsgKey = "model_vendor_back"
+	MsgModeSelectPlaceholder        MsgKey = "mode_select_placeholder"
+	MsgProviderSelectPlaceholder    MsgKey = "provider_select_placeholder"
+	MsgProviderClearOption          MsgKey = "provider_clear_option"
+	MsgCardBack                     MsgKey = "card_back"
+	MsgCardPrev                     MsgKey = "card_prev"
+	MsgCardNext                     MsgKey = "card_next"
+	MsgCardTitleStatus              MsgKey = "card_title_status"
+	MsgCardTitleLanguage            MsgKey = "card_title_language"
+	MsgCardTitleModel               MsgKey = "card_title_model"
+	MsgCardTitleReasoning           MsgKey = "card_title_reasoning"
+	MsgCardTitleMode                MsgKey = "card_title_mode"
+	MsgCardTitleSessions            MsgKey = "card_title_sessions"
+	MsgCardTitleSessionsPaged       MsgKey = "card_title_sessions_paged"
+	MsgCardTitleCurrentSession      MsgKey = "card_title_current_session"
+	MsgCardTitleHistory             MsgKey = "card_title_history"
+	MsgCardTitleHistoryLast         MsgKey = "card_title_history_last"
+	MsgCardTitleProvider            MsgKey = "card_title_provider"
+	MsgCardTitleCron                MsgKey = "card_title_cron"
+	MsgCardTitleTimer               MsgKey = "card_title_timer"
+	MsgCardTitleHeartbeat           MsgKey = "card_title_heartbeat"
+	MsgCardTitleCommands            MsgKey = "card_title_commands"
+	MsgCardTitleAlias               MsgKey = "card_title_alias"
+	MsgCardTitleConfig              MsgKey = "card_title_config"
+	MsgCardTitleSkills              MsgKey = "card_title_skills"
+	MsgCardTitleDoctor              MsgKey = "card_title_doctor"
+	MsgCardTitleVersion             MsgKey = "card_title_version"
+	MsgCardTitleUpgrade             MsgKey = "card_title_upgrade"
+	MsgListItem                     MsgKey = "list_item"
+	MsgListEmptySummary             MsgKey = "list_empty_summary"
+	MsgCronIDLabel                  MsgKey = "cron_id_label"
+	MsgCronFailedSuffix             MsgKey = "cron_failed_suffix"
 
-	MsgTimerNotAvailable  MsgKey = "timer_not_available"
-	MsgTimerUsage         MsgKey = "timer_usage"
-	MsgTimerAddUsage      MsgKey = "timer_add_usage"
-	MsgTimerAdded         MsgKey = "timer_added"
-	MsgTimerAddedExec     MsgKey = "timer_added_exec"
-	MsgTimerAddExecUsage  MsgKey = "timer_addexec_usage"
-	MsgTimerEmpty         MsgKey = "timer_empty"
-	MsgTimerListTitle     MsgKey = "timer_list_title"
-	MsgTimerListFooter    MsgKey = "timer_list_footer"
-	MsgTimerDelUsage      MsgKey = "timer_del_usage"
-	MsgTimerMuteUsage     MsgKey = "timer_mute_usage"
-	MsgTimerDeleted       MsgKey = "timer_deleted"
-	MsgTimerNotFound      MsgKey = "timer_not_found"
-	MsgTimerMuted         MsgKey = "timer_muted"
-	MsgTimerUnmuted       MsgKey = "timer_unmuted"
-	MsgTimerCardHint      MsgKey = "timer_card_hint"
-	MsgTimerBtnMute       MsgKey = "timer_btn_mute"
-	MsgTimerBtnUnmute     MsgKey = "timer_btn_unmute"
-	MsgTimerBtnDelete     MsgKey = "timer_btn_delete"
-	MsgTimerIDLabel       MsgKey = "timer_id_label"
-	MsgTimerScheduledLabel MsgKey = "timer_scheduled_label"
-	MsgTimerFailedSuffix  MsgKey = "timer_failed_suffix"
-	MsgCommandsTagAgent          MsgKey = "commands_tag_agent"
-	MsgCommandsTagShell          MsgKey = "commands_tag_shell"
-	MsgUpgradeTimeoutSuffix      MsgKey = "upgrade_timeout_suffix"
+	MsgTimerNotAvailable    MsgKey = "timer_not_available"
+	MsgTimerUsage           MsgKey = "timer_usage"
+	MsgTimerAddUsage        MsgKey = "timer_add_usage"
+	MsgTimerAdded           MsgKey = "timer_added"
+	MsgTimerAddedExec       MsgKey = "timer_added_exec"
+	MsgTimerAddExecUsage    MsgKey = "timer_addexec_usage"
+	MsgTimerEmpty           MsgKey = "timer_empty"
+	MsgTimerListTitle       MsgKey = "timer_list_title"
+	MsgTimerListFooter      MsgKey = "timer_list_footer"
+	MsgTimerDelUsage        MsgKey = "timer_del_usage"
+	MsgTimerMuteUsage       MsgKey = "timer_mute_usage"
+	MsgTimerDeleted         MsgKey = "timer_deleted"
+	MsgTimerNotFound        MsgKey = "timer_not_found"
+	MsgTimerMuted           MsgKey = "timer_muted"
+	MsgTimerUnmuted         MsgKey = "timer_unmuted"
+	MsgTimerCardHint        MsgKey = "timer_card_hint"
+	MsgTimerBtnMute         MsgKey = "timer_btn_mute"
+	MsgTimerBtnUnmute       MsgKey = "timer_btn_unmute"
+	MsgTimerBtnDelete       MsgKey = "timer_btn_delete"
+	MsgTimerIDLabel         MsgKey = "timer_id_label"
+	MsgTimerScheduledLabel  MsgKey = "timer_scheduled_label"
+	MsgTimerFailedSuffix    MsgKey = "timer_failed_suffix"
+	MsgCommandsTagAgent     MsgKey = "commands_tag_agent"
+	MsgCommandsTagShell     MsgKey = "commands_tag_shell"
+	MsgUpgradeTimeoutSuffix MsgKey = "upgrade_timeout_suffix"
 
 	MsgCronScheduleLabel MsgKey = "cron_schedule_label"
 	MsgCronNextRunLabel  MsgKey = "cron_next_run_label"
@@ -519,6 +519,11 @@ const (
 
 	MsgNewSessionCreated      MsgKey = "new_session_created"
 	MsgNewSessionCreatedName  MsgKey = "new_session_created_name"
+	MsgForkNotSupported       MsgKey = "fork_not_supported"
+	MsgForkNoSession          MsgKey = "fork_no_session"
+	MsgForkOpened             MsgKey = "fork_opened"
+	MsgForkContinue           MsgKey = "fork_continue"
+	MsgForkHere               MsgKey = "fork_here"
 	MsgSessionAutoResetIdle   MsgKey = "session_auto_reset_idle"
 	MsgSessionClosingGraceful MsgKey = "session_closing_graceful"
 
@@ -587,6 +592,7 @@ const (
 	MsgSearchHint     MsgKey = "search_hint"
 
 	MsgBuiltinCmdNew       MsgKey = "new"
+	MsgBuiltinCmdFork      MsgKey = "fork"
 	MsgBuiltinCmdList      MsgKey = "list"
 	MsgBuiltinCmdSearch    MsgKey = "search"
 	MsgBuiltinCmdSwitch    MsgKey = "switch"
@@ -691,8 +697,8 @@ const (
 	// send / cron / timer / relay tool documentation in their native
 	// language. Translation coverage is en + zh for this PR; additional
 	// languages fall back to en automatically.
-	MsgAgentSendToolPrompt MsgKey = "agent_send_tool_prompt"
-	MsgAgentCronToolPrompt MsgKey = "agent_cron_tool_prompt"
+	MsgAgentSendToolPrompt  MsgKey = "agent_send_tool_prompt"
+	MsgAgentCronToolPrompt  MsgKey = "agent_cron_tool_prompt"
 	MsgAgentTimerToolPrompt MsgKey = "agent_timer_tool_prompt"
 	MsgAgentRelayToolPrompt MsgKey = "agent_relay_tool_prompt"
 )
@@ -1041,6 +1047,7 @@ var messages = map[MsgKey]map[Language]string{
 	MsgHelp: {
 		LangEnglish: "📖 Available Commands\n\n" +
 			"/new [name]\n  Start a new session\n\n" +
+			"/fork [name]\n  Fork this session into a new Discord thread\n\n" +
 			"/list\n  List agent sessions\n\n" +
 			"/search <keyword>\n  Search sessions by name or ID\n\n" +
 			"/switch <number>\n  Resume a session by its list number\n\n" +
@@ -1085,6 +1092,7 @@ var messages = map[MsgKey]map[Language]string{
 			"Permission modes: default / edit / plan / yolo",
 		LangChinese: "📖 可用命令\n\n" +
 			"/new [名称]\n  创建新会话\n\n" +
+			"/fork [名称]\n  把当前会话分叉到新 Discord 帖\n\n" +
 			"/list\n  列出 Agent 会话列表\n\n" +
 			"/search <关键词>\n  搜索会话名称或 ID\n\n" +
 			"/switch <序号>\n  按列表序号切换会话\n\n" +
@@ -1129,6 +1137,7 @@ var messages = map[MsgKey]map[Language]string{
 			"权限模式：default / edit / plan / yolo",
 		LangTraditionalChinese: "📖 可用命令\n\n" +
 			"/new [名稱]\n  建立新會話\n\n" +
+			"/fork [名稱]\n  把目前會話分叉到新 Discord 串\n\n" +
 			"/list\n  列出 Agent 會話列表\n\n" +
 			"/search <關鍵詞>\n  搜尋會話名稱或 ID\n\n" +
 			"/switch <序號>\n  按列表序號切換會話\n\n" +
@@ -1172,6 +1181,7 @@ var messages = map[MsgKey]map[Language]string{
 			"權限模式：default / edit / plan / yolo",
 		LangJapanese: "📖 利用可能なコマンド\n\n" +
 			"/new [名前]\n  新しいセッションを開始\n\n" +
+			"/fork [名前]\n  このセッションを新しい Discord スレッドに分岐\n\n" +
 			"/list\n  エージェントセッション一覧\n\n" +
 			"/switch <番号>\n  リスト番号でセッションを切り替え\n\n" +
 			"/delete <番号>|1,2,3|3-7|1,3-5,8\n  リスト番号でセッションを単体/複数削除\n\n" +
@@ -1214,6 +1224,7 @@ var messages = map[MsgKey]map[Language]string{
 			"権限モード: default / edit / plan / yolo",
 		LangSpanish: "📖 Comandos disponibles\n\n" +
 			"/new [nombre]\n  Iniciar una nueva sesión\n\n" +
+			"/fork [nombre]\n  Ramificar esta sesión a un hilo de Discord\n\n" +
 			"/list\n  Listar sesiones del agente\n\n" +
 			"/switch <número>\n  Reanudar sesión por su número en la lista\n\n" +
 			"/delete <número>|1,2,3|3-7|1,3-5,8\n  Eliminar una o varias sesiones por número de lista\n\n" +
@@ -1265,6 +1276,7 @@ var messages = map[MsgKey]map[Language]string{
 	MsgHelpSessionSection: {
 		LangEnglish: "**Session Management**\n" +
 			"/new [name] — Start a new session\n" +
+			"/fork [name] — Fork this session into a new Discord thread\n" +
 			"/list — List agent sessions\n" +
 			"/search <keyword> — Search sessions\n" +
 			"/switch <number> — Resume a session\n" +
@@ -1274,6 +1286,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/history [n] — Show last n messages",
 		LangChinese: "**会话管理**\n" +
 			"/new [名称] — 创建新会话\n" +
+			"/fork [名称] — 把当前会话分叉到新 Discord 帖\n" +
 			"/list — 列出会话列表\n" +
 			"/search <关键词> — 搜索会话\n" +
 			"/switch <序号> — 切换会话\n" +
@@ -1283,6 +1296,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/history [n] — 查看最近 n 条消息",
 		LangTraditionalChinese: "**會話管理**\n" +
 			"/new [名稱] — 建立新會話\n" +
+			"/fork [名稱] — 把目前會話分叉到新 Discord 串\n" +
 			"/list — 列出會話列表\n" +
 			"/search <關鍵詞> — 搜尋會話\n" +
 			"/switch <序號> — 切換會話\n" +
@@ -1292,6 +1306,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/history [n] — 查看最近 n 條訊息",
 		LangJapanese: "**セッション管理**\n" +
 			"/new [名前] — 新しいセッションを開始\n" +
+			"/fork [名前] — このセッションを新しい Discord スレッドに分岐\n" +
 			"/list — セッション一覧\n" +
 			"/search <キーワード> — セッション検索\n" +
 			"/switch <番号> — セッション切り替え\n" +
@@ -1301,6 +1316,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/history [n] — 直近 n 件のメッセージを表示",
 		LangSpanish: "**Gestión de sesiones**\n" +
 			"/new [nombre] — Iniciar nueva sesión\n" +
+			"/fork [nombre] — Ramificar esta sesión a un hilo de Discord\n" +
 			"/list — Listar sesiones\n" +
 			"/search <keyword> — Buscar sesiones\n" +
 			"/switch <número> — Reanudar sesión\n" +
@@ -3227,6 +3243,41 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "✅ 新しいセッションを作成しました：**%s**",
 		LangSpanish:            "✅ Nueva sesión creada: **%s**",
 	},
+	MsgForkNotSupported: {
+		LangEnglish:            "⚠️ /fork is only available with Claude Code.",
+		LangChinese:            "⚠️ /fork 目前只支持 Claude Code。",
+		LangTraditionalChinese: "⚠️ /fork 目前只支援 Claude Code。",
+		LangJapanese:           "⚠️ /fork は現在 Claude Code のみ対応しています。",
+		LangSpanish:            "⚠️ /fork solo está disponible con Claude Code.",
+	},
+	MsgForkNoSession: {
+		LangEnglish:            "⚠️ Nothing to fork yet — send a message first, then /fork.",
+		LangChinese:            "⚠️ 还没有可分叉的会话，先发一条消息再 /fork。",
+		LangTraditionalChinese: "⚠️ 還沒有可分叉的會話，先發一則訊息再 /fork。",
+		LangJapanese:           "⚠️ 分岐できるセッションがまだありません。先にメッセージを送ってから /fork してください。",
+		LangSpanish:            "⚠️ Aún no hay sesión para ramificar: envía un mensaje y luego /fork.",
+	},
+	MsgForkOpened: {
+		LangEnglish:            "✅ Forked into a new thread. This conversation stays here.",
+		LangChinese:            "✅ 已分叉到新帖。这个会话留在这里。",
+		LangTraditionalChinese: "✅ 已分叉到新串。這個會話留在這裡。",
+		LangJapanese:           "✅ 新しいスレッドに分岐しました。この会話はそのまま残ります。",
+		LangSpanish:            "✅ Ramificado a un hilo nuevo. Esta conversación se queda aquí.",
+	},
+	MsgForkContinue: {
+		LangEnglish:            "✅ Forked from the previous thread. Send a message to continue here.",
+		LangChinese:            "✅ 从上一帖分叉过来。在这里发消息继续。",
+		LangTraditionalChinese: "✅ 從上一串分叉過來。在這裡發訊息繼續。",
+		LangJapanese:           "✅ 前のスレッドから分岐しました。ここにメッセージを送って続けてください。",
+		LangSpanish:            "✅ Ramificado desde el hilo anterior. Envía un mensaje para continuar aquí.",
+	},
+	MsgForkHere: {
+		LangEnglish:            "✅ Forked. This chat now uses the copy; the original stays in /list.",
+		LangChinese:            "✅ 已分叉。当前聊天切到复印件，原会话还在 /list。",
+		LangTraditionalChinese: "✅ 已分叉。目前聊天切到複本，原會話還在 /list。",
+		LangJapanese:           "✅ 分岐しました。このチャットはコピー側です。元のセッションは /list に残っています。",
+		LangSpanish:            "✅ Ramificado. Este chat usa la copia; el original sigue en /list.",
+	},
 	MsgSessionAutoResetIdle: {
 		LangEnglish:            "⏰ Session auto-reset after %d minute(s) of inactivity.",
 		LangChinese:            "⏰ 因空闲超过 %d 分钟，已自动切换到新会话。",
@@ -3623,6 +3674,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "建立新會話，參數: [名稱]",
 		LangJapanese:           "新しいセッションを開始、引数: [名前]",
 		LangSpanish:            "Iniciar una nueva sesión, arg: [nombre]",
+	},
+	MsgBuiltinCmdFork: {
+		LangEnglish:            "Fork this session into a new Discord thread, arg: [name]",
+		LangChinese:            "把当前会话分叉到新 Discord 帖，参数: [名称]",
+		LangTraditionalChinese: "把目前會話分叉到新 Discord 串，參數: [名稱]",
+		LangJapanese:           "このセッションを新しい Discord スレッドに分岐、引数: [名前]",
+		LangSpanish:            "Ramificar esta sesión a un hilo de Discord, arg: [nombre]",
 	},
 	MsgBuiltinCmdList: {
 		LangEnglish:            "List agent sessions",

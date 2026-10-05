@@ -87,6 +87,15 @@ type CronReplyTargetResolver interface {
 	ResolveCronReplyTarget(sessionKey string, title string) (resolvedSessionKey string, replyCtx any, err error)
 }
 
+// ForkReplyTargetResolver is an optional interface for platforms that can
+// open a sibling conversation for /fork (e.g. a new Discord thread under
+// the parent channel). Implementations that cannot open a sibling should
+// return ErrNotSupported so the engine falls back to --here on the
+// current session key.
+type ForkReplyTargetResolver interface {
+	ResolveForkReplyTarget(sessionKey string, title string, replyCtx any) (resolvedSessionKey string, destReplyCtx any, err error)
+}
+
 // SessionEnvInjector is an optional interface for agents that accept
 // per-session environment variables (e.g. CC_PROJECT, CC_SESSION_KEY).
 type SessionEnvInjector interface {
@@ -362,6 +371,14 @@ type Agent interface {
 	// ListSessions returns sessions known to the agent backend.
 	ListSessions(ctx context.Context) ([]AgentSessionInfo, error)
 	Stop() error
+}
+
+// SessionForkStarter is an optional interface for agents that can copy an
+// existing backend session into a new id (Claude: --resume <id> --fork-session).
+// /fork requires this; agents that do not implement it get an error reply
+// instead of having the slash forwarded as user text.
+type SessionForkStarter interface {
+	StartForkedSession(ctx context.Context, sessionID string) (AgentSession, error)
 }
 
 // AgentSession represents a running interactive agent session with a persistent process.

@@ -71,6 +71,10 @@ type cujAgent struct {
 
 func (a *cujAgent) Name() string { return "cuj" }
 
+func (a *cujAgent) StartForkedSession(ctx context.Context, sessionID string) (AgentSession, error) {
+	return a.StartSession(ctx, sessionID)
+}
+
 func (a *cujAgent) StartSession(_ context.Context, _ string) (AgentSession, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -1228,6 +1232,44 @@ func TestCUJ_B1_NewCreatesIndependentSession(t *testing.T) {
 	}
 	if len(s2.GetHistory(0)) != 0 {
 		t.Fatalf("/new session should start with empty history, got %d entries", len(s2.GetHistory(0)))
+	}
+}
+
+// CUJ-B13 · /fork copies the current Claude session in place (--here).
+// The original record stays in /list; this chat switches to the copy.
+func TestCUJ_B13_ForkHereKeepsOriginalInList(t *testing.T) {
+	env := newCUJEnv(t)
+	key := "test:b13"
+	env.userSends("b13", "fix the login")
+	env.waitFor("turn1 reply", 2*time.Second, func() bool { return len(env.plat.getSent()) >= 1 })
+	s1 := env.activeSession(key)
+	s1ID := s1.ID
+	if s1.GetAgentSessionID() == "" {
+		t.Fatal("expected an agent session id after the first turn")
+	}
+
+	env.plat.clearSent()
+	env.userSends("b13", "/fork login fork")
+	env.waitFor("fork reply", 2*time.Second, func() bool { return len(env.plat.getSent()) >= 1 })
+
+	if !env.sentContains("Forked") {
+		t.Fatalf("user should see a Forked confirmation, got %#v", env.plat.getSent())
+	}
+	s2 := env.activeSession(key)
+	if s2.ID == s1ID {
+		t.Fatal("/fork --here should switch this chat to the copy")
+	}
+	if s2.GetName() != "login fork" {
+		t.Fatalf("fork name = %q, want login fork", s2.GetName())
+	}
+	var sawOriginal bool
+	for _, s := range env.engine.sessions.ListSessions(key) {
+		if s.ID == s1ID {
+			sawOriginal = true
+		}
+	}
+	if !sawOriginal {
+		t.Fatal("original session must remain in /list after /fork")
 	}
 }
 
