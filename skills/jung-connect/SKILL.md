@@ -4,9 +4,7 @@ description: Use when configuring or operating jung-connect (cc-connect fork) â€
 version: 1.0.0
 author: kidrauhl123
 license: MIT
-metadata:
-  hermes:
-    tags: [jung-connect, cc-connect, discord, telegram, config]
+tags: [jung-connect, cc-connect, discord, telegram, config]
 ---
 
 # jung-connect
