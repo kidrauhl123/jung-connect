@@ -468,6 +468,28 @@ type ReferenceConfig struct {
 }
 
 // ProjectConfig binds one agent (with a specific work_dir) to one or more platforms.
+// ChannelConfig is one [[projects.channels]] entry.
+type ChannelConfig struct {
+	// Match is "platform:channelID", e.g. "discord:1555888557007310899" or
+	// "telegram:-100123". Discord threads match their parent channel unless
+	// the thread ID itself has its own entry.
+	Match string `toml:"match"`
+	// Prompt is appended to the agent's system prompt for sessions started in
+	// this channel (Grok: agent profile; Claude: --append-system-prompt; other
+	// agents: prepended to the first message of a new session).
+	Prompt string `toml:"prompt,omitempty"`
+	// PromptFile is read at load/reload time and appended after Prompt.
+	PromptFile string `toml:"prompt_file,omitempty"`
+	// Skills are skill names (looked up in the workspace and user skill
+	// directories) or absolute/~ paths to skill directories containing SKILL.md.
+	Skills          []string `toml:"skills,omitempty"`
+	Model           string   `toml:"model,omitempty"`
+	ReasoningEffort string   `toml:"reasoning_effort,omitempty"`
+	// WorkDir pins the channel's workspace (multi-workspace mode only); it
+	// takes precedence over /workspace bindings.
+	WorkDir string `toml:"work_dir,omitempty"`
+}
+
 type ProjectConfig struct {
 	Name    string `toml:"name"`
 	Mode    string `toml:"mode,omitempty"`     // "" or "multi-workspace"
@@ -483,11 +505,17 @@ type ProjectConfig struct {
 	// init flow to bind existing local directories. Default false keeps init
 	// limited to git URLs; use /workspace bind or /workspace route for explicit
 	// local bindings.
-	WorkspaceInitAllowLocalPaths *bool              `toml:"workspace_init_allow_local_paths,omitempty"`
-	Agent                        AgentConfig        `toml:"agent"`
-	Platforms                    []PlatformConfig   `toml:"platforms"`
-	Heartbeat                    HeartbeatConfig    `toml:"heartbeat"`
-	AutoCompress                 AutoCompressConfig `toml:"auto_compress"`
+	WorkspaceInitAllowLocalPaths *bool            `toml:"workspace_init_allow_local_paths,omitempty"`
+	Agent                        AgentConfig      `toml:"agent"`
+	Platforms                    []PlatformConfig `toml:"platforms"`
+	// Channels holds Hermes-style per-channel profiles ([[projects.channels]]).
+	// Each entry matches one "platform:channelID" (threads inherit their parent
+	// channel) and can carry a prompt, bound skills, a default model/reasoning
+	// effort and an optional work_dir. Channels without an entry behave exactly
+	// as before.
+	Channels     []ChannelConfig    `toml:"channels,omitempty"`
+	Heartbeat    HeartbeatConfig    `toml:"heartbeat"`
+	AutoCompress AutoCompressConfig `toml:"auto_compress"`
 	// ResetOnIdleMins automatically rotates to a new cc-connect session after
 	// the current session has been inactive for the specified number of minutes.
 	// 0 or nil disables the behavior.
@@ -1053,6 +1081,9 @@ func (c *Config) validateInternal(permissive bool) error {
 			if _, ok := proj.Agent.Options["work_dir"]; ok {
 				return fmt.Errorf("project %q: multi-workspace mode conflicts with agent work_dir (use base_dir instead)", proj.Name)
 			}
+		}
+		if err := validateChannels(prefix, proj.Channels); err != nil {
+			return err
 		}
 		if proj.ResetOnIdleMins != nil && *proj.ResetOnIdleMins < 0 {
 			return fmt.Errorf("config: %s.reset_on_idle_mins must be >= 0", prefix)
@@ -3988,4 +4019,25 @@ func orDefault(v, d int) int {
 		return d
 	}
 	return v
+}
+
+// validateChannels checks [[projects.channels]] entries: match must look like
+// "platform:channelID" and be unique within the project.
+func validateChannels(prefix string, chans []ChannelConfig) error {
+	seen := make(map[string]bool, len(chans))
+	for i, ch := range chans {
+		m := strings.TrimSpace(ch.Match)
+		if m == "" {
+			return fmt.Errorf("config: %s.channels[%d].match is required (\"platform:channelID\")", prefix, i)
+		}
+		idx := strings.IndexByte(m, ':')
+		if idx <= 0 || idx == len(m)-1 {
+			return fmt.Errorf("config: %s.channels[%d].match %q must be \"platform:channelID\"", prefix, i, m)
+		}
+		if seen[m] {
+			return fmt.Errorf("config: %s.channels[%d].match %q is duplicated", prefix, i, m)
+		}
+		seen[m] = true
+	}
+	return nil
 }

@@ -32,6 +32,30 @@ func TestInjectModelArgs_emptyModel(t *testing.T) {
 	}
 }
 
+func TestInjectReasoningEffortArgs_beforeStdio(t *testing.T) {
+	got := injectReasoningEffortArgs([]string{"agent", "--always-approve", "stdio"}, "high")
+	want := []string{"agent", "--always-approve", "--reasoning-effort", "high", "stdio"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+}
+
+func TestInjectReasoningEffortArgs_empty(t *testing.T) {
+	in := []string{"agent", "stdio"}
+	got := injectReasoningEffortArgs(in, "")
+	if !reflect.DeepEqual(got, in) {
+		t.Fatalf("got %#v, want %#v", got, in)
+	}
+}
+
+func TestInjectReasoningEffortArgs_rejectsUnknown(t *testing.T) {
+	in := []string{"agent", "stdio"}
+	got := injectReasoningEffortArgs(in, "max")
+	if !reflect.DeepEqual(got, in) {
+		t.Fatalf("got %#v, want %#v", got, in)
+	}
+}
+
 func TestIsGrokChatModel(t *testing.T) {
 	cases := map[string]bool{
 		"grok-4.6":               true,

@@ -62,9 +62,10 @@ type Agent struct {
 	// callers that pre-date the language option.
 	lang core.Language
 
-	providerProxy  *core.ProviderProxy // local proxy for third-party providers
-	proxyLocalURL  string              // local URL of the proxy
-	platformPrompt string              // platform-specific formatting instructions
+	providerProxy  *core.ProviderProxy         // local proxy for third-party providers
+	proxyLocalURL  string                      // local URL of the proxy
+	platformPrompt string                      // platform-specific formatting instructions
+	pendingChannel *core.ChannelSessionProfile // staged by SetChannelProfile, consumed by StartSession
 
 	// ccDataDir is injected by the cc-connect host (see buildAgentOptions
 	// in cmd/cc-connect/main.go). It locates the global directory where
@@ -424,6 +425,16 @@ func (a *Agent) SetSessionEnv(env []string) {
 	a.sessionEnv = env
 }
 
+// SetChannelProfile stages a [[projects.channels]] profile for the next
+// StartSession: its prompt is appended to --append-system-prompt, its plugin
+// dir (bound skills) is passed via --plugin-dir, and model/effort override the
+// agent defaults for that session.
+func (a *Agent) SetChannelProfile(p *core.ChannelSessionProfile) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pendingChannel = p
+}
+
 func (a *Agent) SetPlatformPrompt(prompt string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -477,6 +488,8 @@ func validateSessionIDInProject(homeDir, workDir, sessionID string) bool {
 // StartSession creates a persistent interactive Claude Code session.
 func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
 	a.mu.Lock()
+	channel := a.pendingChannel
+	a.pendingChannel = nil
 	tools := make([]string, len(a.allowedTools))
 	copy(tools, a.allowedTools)
 	disTools := make([]string, len(a.disallowedTools))
@@ -515,6 +528,25 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	// (verbose emits non-JSON text to stdout that corrupts the JSON stream).
 	disableVerbose := a.routerURL != ""
 	a.mu.Unlock()
+
+	if channel != nil {
+		if p := strings.TrimSpace(channel.Prompt); p != "" {
+			if strings.TrimSpace(appendSystemPrompt) != "" {
+				appendSystemPrompt = appendSystemPrompt + "\n\n" + p
+			} else {
+				appendSystemPrompt = p
+			}
+		}
+		if channel.PluginDir != "" {
+			pluginDirs = append(pluginDirs, channel.PluginDir)
+		}
+		if m := strings.TrimSpace(channel.Model); m != "" {
+			model = m
+		}
+		if e := strings.TrimSpace(channel.ReasoningEffort); e != "" {
+			effort = e
+		}
+	}
 
 	return newClaudeSession(ctx, workDir, a.cmd, a.cliExtraArgs, a.cmdArgsFlag, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt, tools, disTools, pluginDirs, extraEnv, platformPrompt, disableVerbose, a.spawnOpts, maxTok, a.ccDataDir, lang)
 }

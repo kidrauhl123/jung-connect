@@ -12,6 +12,9 @@ type projectStateData struct {
 	WorkDirOverride         string            `json:"work_dir_override,omitempty"`
 	WorkspaceDirOverrides   map[string]string `json:"workspace_dir_overrides,omitempty"`
 	WorkspaceModelOverrides map[string]string `json:"workspace_model_overrides,omitempty"`
+	// ChannelModelOverrides holds /model choices made in channels that have a
+	// [[projects.channels]] profile, keyed by the profile's match.
+	ChannelModelOverrides map[string]string `json:"channel_model_overrides,omitempty"`
 }
 
 // ProjectStateStore persists lightweight runtime state for one project.
@@ -103,6 +106,28 @@ func (ps *ProjectStateStore) ClearWorkspaceModelOverride(workspace string) {
 	if len(ps.state.WorkspaceModelOverrides) == 0 {
 		ps.state.WorkspaceModelOverrides = nil
 	}
+}
+
+func (ps *ProjectStateStore) ChannelModelOverride(match string) string {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return ps.state.ChannelModelOverrides[match]
+}
+
+func (ps *ProjectStateStore) SetChannelModelOverride(match, model string) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if model == "" {
+		delete(ps.state.ChannelModelOverrides, match)
+		if len(ps.state.ChannelModelOverrides) == 0 {
+			ps.state.ChannelModelOverrides = nil
+		}
+		return
+	}
+	if ps.state.ChannelModelOverrides == nil {
+		ps.state.ChannelModelOverrides = make(map[string]string)
+	}
+	ps.state.ChannelModelOverrides[match] = model
 }
 
 func (ps *ProjectStateStore) ClearWorkDirOverride() {
