@@ -992,6 +992,21 @@ mode = "default" # "default" | "acceptEdits" (edit) | "plan" | "auto" | "bypassP
 # marker_style = "emoji"            # none | ascii | emoji
 # enclosure_style = "code"          # none | bracket | angle | fullwidth | code
 
+# ── Per-channel profiles (optional) / 按频道配置（可选） ──────────────
+# Hermes-style channel_prompts / channel_skill_bindings / channel_overrides.
+# match = "platform:channelID"; Discord threads inherit their parent channel.
+# Channels without an entry behave exactly as before. Reload: /config reload.
+# See docs/channel-profiles.md.
+#
+# [[projects.channels]]
+# match = "discord:1555888557007310899"
+# prompt = "这个频道绑定仓库 kidrauhl123/NianNian……"
+# prompt_file = "prompts/niannian.md"   # optional, relative to this file
+# skills = ["niannian"]                  # names or paths to dirs with SKILL.md
+# model = "grok-4.6-xhigh"               # optional channel default model
+# reasoning_effort = "high"              # optional
+# work_dir = "/home/box/workspaces/NianNian"  # optional, multi-workspace only
+
 # Feishu / Lark / 飞书
 # 1. Create an app at https://open.feishu.cn / 在 https://open.feishu.cn 创建应用
 # 2. Enable Bot capability / 开启机器人能力

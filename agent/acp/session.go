@@ -35,6 +35,12 @@ type acpSession struct {
 	// handshake returns — the stdout pipe fills, and the agent is left a zombie.
 	loading atomic.Bool
 
+	// startedNew is set when the handshake created a fresh session (no
+	// resume, or session/load failed). pendingPromptPrefix is prepended to
+	// the next Send exactly once (guarded by sendMu).
+	startedNew          atomic.Bool
+	pendingPromptPrefix string
+
 	cmd *exec.Cmd
 	tr  *transport
 
@@ -80,6 +86,10 @@ type acpSessionConfig struct {
 	initialModel    string           // if non-empty, applied via session/set_config_option after handshake
 	initialEffort   string           // if non-empty, applied via session/set_config_option configId=reasoning_effort
 	callbacks       sessionCallbacks // may be nil
+	// newSessionPromptPrefix is prepended to the first prompt when the
+	// handshake had to create a new session (channel-profile fallback for
+	// ACP agents without native support).
+	newSessionPromptPrefix string
 }
 
 func newACPSession(ctx context.Context, cfg acpSessionConfig) (*acpSession, error) {
@@ -183,6 +193,12 @@ func newACPSession(ctx context.Context, cfg acpSessionConfig) (*acpSession, erro
 		}
 	}
 
+	if cfg.newSessionPromptPrefix != "" && s.startedNew.Load() {
+		s.sendMu.Lock()
+		s.pendingPromptPrefix = cfg.newSessionPromptPrefix
+		s.sendMu.Unlock()
+	}
+
 	return s, nil
 }
 
@@ -277,6 +293,7 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 	}
 	s.setACPSessionID(sn.SessionID)
 	s.absorbModes(sn.Modes)
+	s.startedNew.Store(true)
 	return nil
 }
 
@@ -682,6 +699,11 @@ func (s *acpSession) Send(prompt string, messageID string, images []core.ImageAt
 
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
+
+	if s.pendingPromptPrefix != "" {
+		prompt = s.pendingPromptPrefix + prompt
+		s.pendingPromptPrefix = ""
+	}
 
 	filePaths := core.SaveFilesToDisk(s.workDir, messageID, files)
 	prompt = core.AppendFileRefs(prompt, filePaths)

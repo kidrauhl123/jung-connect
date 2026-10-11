@@ -715,6 +715,9 @@ func main() {
 			}
 			engine.SetAutoCompressConfig(true, maxTokens, minGap)
 		}
+		if err := applyChannelProfiles(engine, &proj, configPath); err != nil {
+			slog.Error("channel profiles: load failed", "project", proj.Name, "err", err)
+		}
 		resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
 		engine.SetResetOnIdle(resetIdle)
 		if defaulted {
@@ -1797,6 +1800,9 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	} else {
 		engine.SetAutoCompressConfig(false, 0, 0)
 	}
+	if err := applyChannelProfiles(engine, proj, configPath); err != nil {
+		return nil, fmt.Errorf("reload channel profiles: %w", err)
+	}
 	resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
 	engine.SetResetOnIdle(resetIdle)
 	if defaulted {
@@ -2095,4 +2101,31 @@ func derefInt(v *int) int {
 		return 0
 	}
 	return *v
+}
+
+// applyChannelProfiles converts [[projects.channels]] into engine channel
+// profiles. prompt_file paths resolve relative to the config file's directory.
+func applyChannelProfiles(engine *core.Engine, proj *config.ProjectConfig, configPath string) error {
+	profiles, err := channelProfilesFromConfig(proj.Channels, filepath.Dir(configPath))
+	if err != nil {
+		return err
+	}
+	engine.SetChannelProfiles(profiles)
+	return nil
+}
+
+func channelProfilesFromConfig(chans []config.ChannelConfig, baseDir string) ([]core.ChannelProfile, error) {
+	raw := make([]core.ChannelProfile, 0, len(chans))
+	for _, ch := range chans {
+		raw = append(raw, core.ChannelProfile{
+			Match:           ch.Match,
+			Prompt:          ch.Prompt,
+			PromptFile:      ch.PromptFile,
+			Skills:          append([]string(nil), ch.Skills...),
+			Model:           ch.Model,
+			ReasoningEffort: ch.ReasoningEffort,
+			WorkDir:         ch.WorkDir,
+		})
+	}
+	return core.NormalizeChannelProfiles(raw, baseDir)
 }

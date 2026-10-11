@@ -60,6 +60,15 @@ type Agent struct {
 	// handshake so that future PermissionModes() calls can reflect the
 	// actual modes this specific ACP agent offers (rather than a
 	// hard-coded fallback that may not match).
+	// channelProfileMode selects how [[projects.channels]] profiles are
+	// applied: "grok" passes --agent-profile/--plugin-dir to the subprocess
+	// (Grok Build), "prompt" prepends a <channel-context> block to the first
+	// prompt of a new session. Empty = auto (grok when cmd/args mention grok).
+	channelProfileMode string
+	// pendingChannel is staged by SetChannelProfile and consumed by the next
+	// StartSession.
+	pendingChannel *core.ChannelSessionProfile
+
 	modesMu      sync.RWMutex
 	modesCache   []core.PermissionModeInfo
 	modesCurrent string
@@ -81,6 +90,9 @@ var _ sessionCallbacks = (*Agent)(nil)
 
 // Ensure *Agent satisfies ModelSwitcher at compile time.
 var _ core.ModelSwitcher = (*Agent)(nil)
+
+// Ensure *Agent satisfies ChannelProfileInjector at compile time.
+var _ core.ChannelProfileInjector = (*Agent)(nil)
 
 // Ensure *Agent satisfies ReasoningEffortSwitcher at compile time.
 var _ core.ReasoningEffortSwitcher = (*Agent)(nil)
@@ -118,19 +130,22 @@ func New(opts map[string]any) (core.Agent, error) {
 	model = strings.TrimSpace(model)
 	reasoningEffort, _ := opts["reasoning_effort"].(string)
 	reasoningEffort = normalizeReasoningEffort(reasoningEffort)
+	channelProfileMode, _ := opts["channel_profile_mode"].(string)
+	channelProfileMode = strings.ToLower(strings.TrimSpace(channelProfileMode))
 
 	return &Agent{
-		workDir:         workDir,
-		cmd:             cmdStr,
-		cliExtraArgs:    cliExtraArgs,
-		args:            args,
-		staticEnv:       staticEnv,
-		extraEnv:        extra,
-		authMethod:      authMethod,
-		displayName:     displayName,
-		mode:            mode,
-		model:           model,
-		reasoningEffort: reasoningEffort,
+		channelProfileMode: channelProfileMode,
+		workDir:            workDir,
+		cmd:                cmdStr,
+		cliExtraArgs:       cliExtraArgs,
+		args:               args,
+		staticEnv:          staticEnv,
+		extraEnv:           extra,
+		authMethod:         authMethod,
+		displayName:        displayName,
+		mode:               mode,
+		model:              model,
+		reasoningEffort:    reasoningEffort,
 	}, nil
 }
 
@@ -246,7 +261,37 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	if a.reasoningEffort != "" {
 		opts["reasoning_effort"] = a.reasoningEffort
 	}
+	if a.channelProfileMode != "" {
+		opts["channel_profile_mode"] = a.channelProfileMode
+	}
 	return opts
+}
+
+// SetChannelProfile stages a channel profile for the next StartSession.
+func (a *Agent) SetChannelProfile(p *core.ChannelSessionProfile) {
+	a.mu.Lock()
+	a.pendingChannel = p
+	a.mu.Unlock()
+}
+
+// usesGrokChannelFlags reports whether channel profiles are applied through
+// Grok Build's --agent-profile / --plugin-dir flags.
+func (a *Agent) usesGrokChannelFlags() bool {
+	switch a.channelProfileMode {
+	case "grok":
+		return true
+	case "prompt", "none":
+		return false
+	}
+	if strings.Contains(strings.ToLower(filepath.Base(a.cmd)), "grok") {
+		return true
+	}
+	for _, arg := range append(append([]string{}, a.cliExtraArgs...), a.args...) {
+		if strings.Contains(strings.ToLower(filepath.Base(arg)), "grok") {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Agent) SetSessionEnv(env []string) {
@@ -256,7 +301,10 @@ func (a *Agent) SetSessionEnv(env []string) {
 }
 
 func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
-	a.mu.RLock()
+	a.mu.Lock()
+	channel := a.pendingChannel
+	a.pendingChannel = nil
+	grokFlags := a.usesGrokChannelFlags()
 	command := a.cmd
 	allArgs := append(append([]string{}, a.cliExtraArgs...), a.args...)
 	workDir := a.workDir
@@ -266,22 +314,38 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	pendingEffort := a.reasoningEffort
 	extra := append([]string(nil), a.extraEnv...)
 	extra = append(extra, a.sessionEnv...)
-	a.mu.RUnlock()
+	a.mu.Unlock()
+
+	firstPromptPrefix := ""
+	if channel != nil {
+		if m := strings.TrimSpace(channel.Model); m != "" {
+			pendingModel = m
+		}
+		if e := normalizeReasoningEffort(channel.ReasoningEffort); e != "" {
+			pendingEffort = e
+		}
+		if grokFlags {
+			allArgs = injectChannelProfileArgs(allArgs, channel.AgentProfilePath, channel.PluginDir)
+		} else if p := strings.TrimSpace(channel.Prompt); p != "" {
+			firstPromptPrefix = "<channel-context>\n" + p + "\n</channel-context>\n\n"
+		}
+	}
 
 	allArgs = injectModelArgs(allArgs, pendingModel)
 	allArgs = injectReasoningEffortArgs(allArgs, pendingEffort)
 
 	return newACPSession(ctx, acpSessionConfig{
-		command:         command,
-		args:            allArgs,
-		extraEnv:        extra,
-		workDir:         workDir,
-		resumeSessionID: sessionID,
-		authMethod:      authMethod,
-		initialMode:     pendingMode,
-		initialModel:    pendingModel,
-		initialEffort:   pendingEffort,
-		callbacks:       a,
+		newSessionPromptPrefix: firstPromptPrefix,
+		command:                command,
+		args:                   allArgs,
+		extraEnv:               extra,
+		workDir:                workDir,
+		resumeSessionID:        sessionID,
+		authMethod:             authMethod,
+		initialMode:            pendingMode,
+		initialModel:           pendingModel,
+		initialEffort:          pendingEffort,
+		callbacks:              a,
 	})
 }
 
@@ -539,6 +603,35 @@ func injectModelArgs(args []string, model string) []string {
 	}
 	if !inserted {
 		out = append(out, "-m", model)
+	}
+	return out
+}
+
+// injectChannelProfileArgs inserts `--agent-profile <path>` and
+// `--plugin-dir <dir>` before a trailing `stdio` arg (or at the end). Empty
+// values add nothing, so unconfigured channels keep their exact argv.
+func injectChannelProfileArgs(args []string, profilePath, pluginDir string) []string {
+	var extra []string
+	if p := strings.TrimSpace(profilePath); p != "" {
+		extra = append(extra, "--agent-profile", p)
+	}
+	if d := strings.TrimSpace(pluginDir); d != "" {
+		extra = append(extra, "--plugin-dir", d)
+	}
+	if len(extra) == 0 {
+		return append([]string(nil), args...)
+	}
+	out := make([]string, 0, len(args)+len(extra))
+	inserted := false
+	for _, a := range args {
+		if !inserted && a == "stdio" {
+			out = append(out, extra...)
+			inserted = true
+		}
+		out = append(out, a)
+	}
+	if !inserted {
+		out = append(out, extra...)
 	}
 	return out
 }

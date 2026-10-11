@@ -422,6 +422,7 @@ type Engine struct {
 	dirHistory                   *DirHistory
 	baseWorkDir                  string
 	projectState                 *ProjectStateStore
+	channelProfiles              channelProfileStore
 
 	// Auto-compress settings
 	autoCompressEnabled   bool
@@ -538,7 +539,11 @@ type queuedMessage struct {
 
 // interactiveState tracks a running interactive agent session and its permission state.
 type interactiveState struct {
-	agentSession             AgentSession
+	agentSession AgentSession
+	// pendingChannelContext is a <channel-context> block prepended to the
+	// first prompt of a freshly started session for agents without native
+	// channel-profile support (see ChannelProfileInjector).
+	pendingChannelContext    string
 	platform                 Platform
 	replyCtx                 any
 	currentMessageID         string
@@ -2975,6 +2980,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	if e.multiWorkspace {
 		e.migrateLegacyWorkspaceBindings(msg)
 	}
+	// Remember the parent channel of this session so channel profiles
+	// resolve for threads from session-key-only paths (session start, /model).
+	e.channelProfileForMessage(msg)
 	if forcedWorkDir := e.sendWorkDirForSession(msg.SessionKey); forcedWorkDir != "" {
 		e.bindSendWorkDir(msg.SessionKey, forcedWorkDir)
 		var err error
@@ -2988,7 +2996,13 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	} else if e.multiWorkspace {
 		channelID := effectiveChannelID(msg)
 		channelKey := effectiveWorkspaceChannelKey(msg)
-		workspace, channelName, err := e.resolveWorkspace(p, channelID)
+		var workspace, channelName string
+		var err error
+		if wd := e.channelWorkDirForKey(channelKeysForMessage(msg)...); wd != "" {
+			workspace = normalizeWorkspacePath(wd)
+		} else {
+			workspace, channelName, err = e.resolveWorkspace(p, channelID)
+		}
 		if err != nil {
 			slog.Error("workspace resolution failed", "err", err)
 			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
@@ -3908,6 +3922,10 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 
 	sendStart := time.Now()
 	state.mu.Lock()
+	if state.pendingChannelContext != "" {
+		promptContent = state.pendingChannelContext + promptContent
+		state.pendingChannelContext = ""
+	}
 	state.currentMessageID = msg.MessageID
 	state.fromVoice = msg.FromVoice
 	state.sideText = ""
@@ -4191,6 +4209,25 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		ppi.SetPlatformPrompt(prompt)
 	}
 
+	// Channel profile ([[projects.channels]]): native agents get it staged for
+	// the next StartSession (always staged, nil clears); others get a
+	// <channel-context> block prepended to the first prompt of a new session.
+	var channelSP *ChannelSessionProfile
+	if cp := e.channelProfileForSessionKey(ccKey); cp != nil {
+		workDir := ""
+		if wd, ok := agent.(interface{ GetWorkDir() string }); ok {
+			workDir = wd.GetWorkDir()
+		}
+		channelSP = e.buildChannelSessionProfile(cp, workDir)
+	}
+	channelInjector, channelNative := agent.(ChannelProfileInjector)
+	stageChannelProfile := func() {
+		if channelNative {
+			channelInjector.SetChannelProfile(channelSP)
+		}
+	}
+	stageChannelProfile()
+
 	// Check if context is already canceled (e.g. during shutdown/restart)
 	if e.ctx.Err() != nil {
 		slog.Debug("skipping session start: context canceled", "session_key", sessionKey)
@@ -4242,6 +4279,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	}
 
 	isResume := startSessionID != ""
+	freshStart := !isResume
 	startAt := time.Now()
 	agentSession, err := agent.StartSession(e.ctx, startSessionID)
 	startElapsed := time.Since(startAt)
@@ -4256,6 +4294,8 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 			session.SetAgentSessionID("", agent.Name())
 			sessions.Save()
 			startAt = time.Now()
+			stageChannelProfile()
+			freshStart = true
 			agentSession, err = agent.StartSession(e.ctx, "")
 			startElapsed = time.Since(startAt)
 			if err == nil {
@@ -4314,6 +4354,9 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		replyCtx:         replyCtx,
 		agent:            agent,
 		eventsNeedResync: true,
+	}
+	if channelSP != nil && !channelNative && freshStart {
+		newState.pendingChannelContext = channelContextBlock(channelSP)
 	}
 	adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
 	state = newState
@@ -12477,7 +12520,17 @@ func (e *Engine) handleModelCardAction(args, sessionKey string) *Card {
 }
 
 func (e *Engine) persistWorkspaceModelOverride(interactiveKey, sessionKey string, agent Agent, model string) {
-	if e.projectState == nil || !e.multiWorkspace || model == "" {
+	if e.projectState == nil || model == "" {
+		return
+	}
+	// Channels with a [[projects.channels]] profile keep their own /model
+	// choice instead of changing the whole workspace's default.
+	if cp := e.channelProfileForSessionKey(sessionKey); cp != nil {
+		e.projectState.SetChannelModelOverride(cp.Match, model)
+		e.projectState.Save()
+		return
+	}
+	if !e.multiWorkspace {
 		return
 	}
 	workspace := workspaceModelOverrideKey(interactiveKey, sessionKey, agent)
@@ -16798,8 +16851,11 @@ func (e *Engine) commandContextWithWorkspace(p Platform, msg *Message) (Agent, *
 	if channelKey == "" || channelID == "" {
 		return e.agent, e.sessions, msg.SessionKey, "", nil
 	}
-	workspace, _, err := e.resolveWorkspace(p, channelID)
-	if err != nil {
+	var workspace string
+	var err error
+	if wd := e.channelWorkDirForKey(channelKeysForMessage(msg)...); wd != "" {
+		workspace = normalizeWorkspacePath(wd)
+	} else if workspace, _, err = e.resolveWorkspace(p, channelID); err != nil {
 		return nil, nil, "", "", err
 	}
 	if workspace == "" {
@@ -16825,6 +16881,11 @@ func (e *Engine) sessionContextForKey(sessionKey string) (Agent, *SessionManager
 	}
 	if !e.multiWorkspace || e.workspaceBindings == nil {
 		return e.agent, e.sessions
+	}
+	if cp := e.channelProfileForSessionKey(sessionKey); cp != nil && cp.WorkDir != "" {
+		if wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(normalizeWorkspacePath(cp.WorkDir)); err == nil {
+			return wsAgent, wsSessions
+		}
 	}
 	if channelKey := extractWorkspaceChannelKey(sessionKey); channelKey != "" {
 		if b, _, usable := e.lookupEffectiveWorkspaceBinding(channelKey); usable {
@@ -16969,6 +17030,9 @@ func (e *Engine) interactiveKeyForSessionKeyLocked(sessionKey string) string {
 	}
 	if _, ok := e.interactiveStates[sessionKey]; ok {
 		return sessionKey
+	}
+	if cp := e.channelProfileForSessionKey(sessionKey); cp != nil && cp.WorkDir != "" {
+		return normalizeWorkspacePath(cp.WorkDir) + ":" + sessionKey
 	}
 	if channelKey := extractWorkspaceChannelKey(sessionKey); channelKey != "" {
 		if b, _, usable := e.lookupEffectiveWorkspaceBinding(channelKey); usable {
