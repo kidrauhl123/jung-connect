@@ -322,3 +322,11 @@ func TestOnNotification_dropsSessionLoadReplay(t *testing.T) {
 		t.Fatal("live tool_call was dropped")
 	}
 }
+
+func TestMapSessionUpdate_AgentThoughtChunkIsThinking(t *testing.T) {
+	params := []byte(`{"sessionId":"s1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"The user said hi"}}}`)
+	evs := mapSessionUpdate("s1", params)
+	if len(evs) != 1 || evs[0].Type != core.EventThinking {
+		t.Fatalf("want 1 thinking event, got %+v", evs)
+	}
+}
