@@ -1,7 +1,7 @@
 ---
 name: jung-connect
 description: Use when configuring or operating jung-connect (cc-connect fork) — per-channel prompt/skills/model, allow_from, /workspace, /model, reload vs restart.
-version: 1.0.0
+version: 1.1.0
 author: kidrauhl123
 license: MIT
 tags: [jung-connect, cc-connect, discord, telegram, config]
@@ -61,6 +61,20 @@ work_dir = "/path/to/repo"     # 可选，仅 multi-workspace；优先于 /works
 - 匹配：先会话所在的精确 `平台:频道ID`（Discord 帖子是帖子自己的 ID），再父频道。Discord 帖子要继承父频道，需要平台开 `thread_isolation = true`。
 - 技能名依次找 `<workdir>/.grok|.claude|.agents/skills`、`~/.grok/skills`、`~/.claude/skills`、`~/.agents/skills`、`~/.hermes/skills`（各含一层分类目录），先找到先用；找不到只记日志跳过。
 - 怎么送到 agent：Grok Build（ACP）用生成的 agent profile + plugin 目录，续聊和压缩后仍在；Claude Code 用 `--append-system-prompt` + `--plugin-dir`；其它 agent 只在**新会话**第一条消息前加 `<channel-context>`。
+
+## 写频道提示词
+
+替用户写 `prompt` / `prompt_file` 时，除了频道职责，固定带上一段"主动沉淀"，因为 agent 没有自动记忆，不写就不会做：
+
+```markdown
+## 维护本频道
+- 做完重要的事、定下决定、发现新情况时，主动更新本频道的笔记文件（写明路径），只记结论和现状，不记过程。
+- 反复用到的做法整理成技能（`<技能目录>/<名>/SKILL.md`），并加进本频道 `skills`。
+- 职责或规则变了就改本频道提示词文件，然后 `/config reload`。
+- 改动前备份或用 git 提交；不写入 token、密码等秘密。
+```
+
+把笔记、提示词、技能的实际路径填进去；路径放在 git 管理的目录里，方便回滚和多机同步。
 
 ## 改完怎么生效
 
