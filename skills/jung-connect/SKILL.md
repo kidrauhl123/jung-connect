@@ -1,7 +1,7 @@
 ---
 name: jung-connect
 description: Use when configuring or operating jung-connect (cc-connect fork) — per-channel prompt/skills/model, allow_from, /workspace, /model, reload vs restart.
-version: 1.1.0
+version: 1.1.1
 author: kidrauhl123
 license: MIT
 tags: [jung-connect, cc-connect, discord, telegram, config]
@@ -51,7 +51,7 @@ allow_from = "<你的用户ID>"          # 逗号分隔的用户 ID；不能留�
 [[projects.channels]]
 match = "discord:<频道ID>"     # 平台:频道ID；Telegram 是 telegram:<chat_id>
 prompt = "这个频道只做 X 仓库的代码评审……"
-prompt_file = "prompts/x.md"   # 可选，相对配置文件，接在 prompt 后
+prompt_file = "prompts/x.md"   # 可选，接在 prompt 后；相对路径按配置文件所在目录，也可用 ~ 或绝对路径
 skills = ["code-review"]       # 技能名，或含 SKILL.md 的目录（可用 ~ 或绝对路径）
 model = "<模型ID>"             # 可选，频道默认模型
 reasoning_effort = "high"      # 可选
@@ -60,6 +60,7 @@ work_dir = "/path/to/repo"     # 可选，仅 multi-workspace；优先于 /works
 
 - 匹配：先会话所在的精确 `平台:频道ID`（Discord 帖子是帖子自己的 ID），再父频道。Discord 帖子要继承父频道，需要平台开 `thread_isolation = true`。
 - 技能名依次找 `<workdir>/.grok|.claude|.agents/skills`、`~/.grok/skills`、`~/.claude/skills`、`~/.agents/skills`、`~/.hermes/skills`（各含一层分类目录），先找到先用；找不到只记日志跳过。
+- `prompt_file`、`skills`、`work_dir` 里的 `~` 按 `$HOME` 展开，没设 HOME（如 systemd unit）时取当前用户的家目录。旧版本此时不展开：给 unit 加 `Environment=HOME=…` 或写绝对路径。`prompt_file` 读不到时整组频道配置不加载，看日志 `channel profiles: load failed`。
 - 怎么送到 agent：Grok Build（ACP）用生成的 agent profile + plugin 目录，续聊和压缩后仍在；Claude Code 用 `--append-system-prompt` + `--plugin-dir`；其它 agent 只在**新会话**第一条消息前加 `<channel-context>`。
 
 ## 写频道提示词

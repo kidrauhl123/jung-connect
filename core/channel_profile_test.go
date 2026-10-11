@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -286,5 +287,19 @@ func TestChannelWorkDir_OverridesBinding(t *testing.T) {
 	}
 	if got := e.interactiveKeyForSessionKey(msg.SessionKey); got != want+":"+msg.SessionKey {
 		t.Fatalf("interactiveKeyForSessionKey = %q", got)
+	}
+}
+
+func TestExpandHomePath_NoHOMEFallsBackToPasswd(t *testing.T) {
+	u, err := user.Current()
+	if err != nil || u.HomeDir == "" {
+		t.Skip("no passwd entry for current user")
+	}
+	t.Setenv("HOME", "")
+	if got, want := expandHomePath("~/notes/x.md"), filepath.Join(u.HomeDir, "notes/x.md"); got != want {
+		t.Fatalf("expandHomePath = %q, want %q", got, want)
+	}
+	if got := expandHomePath("/abs/x.md"); got != "/abs/x.md" {
+		t.Fatalf("absolute path changed: %q", got)
 	}
 }

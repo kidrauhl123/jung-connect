@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/user"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -124,11 +125,23 @@ func NormalizeChannelProfiles(in []ChannelProfile, baseDir string) ([]ChannelPro
 
 func expandHomePath(p string) string {
 	if p == "~" || strings.HasPrefix(p, "~/") {
-		if home, err := os.UserHomeDir(); err == nil {
+		if home := channelHomeDir(); home != "" {
 			return filepath.Join(home, strings.TrimPrefix(p, "~"))
 		}
 	}
 	return p
+}
+
+// channelHomeDir returns $HOME, falling back to the passwd entry of the
+// current user when $HOME is unset (e.g. systemd units without HOME).
+func channelHomeDir() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return home
+	}
+	if u, err := user.Current(); err == nil {
+		return u.HomeDir
+	}
+	return ""
 }
 
 // SetChannelProfiles replaces the engine's channel profiles (startup and
@@ -269,7 +282,7 @@ func skillSearchRoots(workDir string) []string {
 			roots = append(roots, filepath.Join(workDir, d))
 		}
 	}
-	if home, err := os.UserHomeDir(); err == nil {
+	if home := channelHomeDir(); home != "" {
 		for _, d := range []string{".grok/skills", ".claude/skills", ".agents/skills", ".hermes/skills"} {
 			roots = append(roots, filepath.Join(home, d))
 		}
