@@ -25,9 +25,23 @@ jung-connect（`kidrauhl123/jung-connect`）是 cc-connect（`chenhg5/cc-connect
 
 ## 配置要点（TOML）
 
-- `[[projects]]`：一个项目 = 一个 agent + 若干平台。`[projects.agent]` 的 `type`（`acp`/`claudecode`/`codex`/`opencode`/`pi`/`antigravity`…）和 `[projects.agent.options]`（`work_dir`、`cmd`、`model`、`mode`…）。
-- `[[projects.platforms]]`：`type` + `[projects.platforms.options]`（`token`、`allow_from`、平台选项）。
-- `allow_from`：逗号分隔的**用户 ID** 白名单（谁能驱动 agent），**不是频道 ID**。ID 让本人在聊天里发 `/whoami` 拿。空或 `"*"` = 任何人都能在这台机上跑 agent，**绝不要这样设**，也不要为了"让某个频道能用"去放宽它。
+```toml
+[[projects]]
+name = "my-bot"
+[projects.agent]
+type = "acp"                        # acp / claudecode / codex / opencode / pi / antigravity …
+[projects.agent.options]
+work_dir = "/path/to/dir"
+cmd = "grok"
+[[projects.platforms]]
+type = "discord"
+[projects.platforms.options]
+token = "${DISCORD_BOT_TOKEN}"      # 支持 ${环境变量}，别写明文
+allow_from = "<你的用户ID>"          # 逗号分隔的用户 ID；不能留空，不能 "*"
+```
+
+- 一个 `[[projects]]` = 一个 agent + 若干平台。`allow_from`、`token` 和平台选项都在 `[projects.platforms.options]` 里，不在 `[[projects.platforms]]` 本身。
+- `allow_from`：**用户 ID** 白名单（谁能驱动 agent），**不是频道 ID**。ID 让本人在聊天里发 `/whoami` 拿。空或 `"*"` 都等于任何人能在这台机上跑 agent，**绝不要这样设，示例里也别写"可空或 *"**，也不要为了"让某个频道能用"去放宽它。频道 ID 只出现在 `[[projects.channels]]` 的 `match` 里。
 - `admin_from`：能用 `/shell` `/show` `/dir` `/restart` `/upgrade` `/web` 的用户 ID；空 = 谁都不行。
 - 多工作区：`mode = "multi-workspace"` + `base_dir`，频道名对上 `base_dir/<频道名>` 自动绑定；`fallback_work_dir` 给没绑的频道。
 
@@ -53,7 +67,7 @@ work_dir = "/path/to/repo"     # 可选，仅 multi-workspace；优先于 /works
 ## 改完怎么生效
 
 - 聊天里 `/config reload` 重读：`[[projects.channels]]`、display、providers、自定义命令和别名、`admin_from`、`users`、`disabled_commands`、`banned_words` 等。频道配置只作用于**新会话**，当前会话发 `/new`。
-- 必须重启进程：平台块（token、`allow_from`、平台选项）、`[projects.agent]`、`mode`/`base_dir`、增删项目。systemd 用 `systemctl restart <unit>`（用户级加 `--user`）；`cc-connect daemon restart` 只管 `daemon install` 装的那个 unit；循环脚本就给那个 PID 发 `SIGTERM` 让脚本拉起，**不要再手动起第二份**（同一 token 两路连接会互踢或 409）。聊天里 `/restart` 需要 `admin_from`。重启会打断正在跑的回合，先告诉用户。
+- 必须重启进程：平台块（token、`allow_from`、平台选项）、`[projects.agent]`、`mode`/`base_dir`、增删项目。systemd 用 `systemctl restart <unit>`（用户级加 `--user`，unit 名以上面查到的为准）；`cc-connect daemon restart` 只管 `cc-connect daemon install` 装的 `cc-connect` unit，自写的 unit 别用它；循环脚本就给那个 PID 发 `SIGTERM` 让脚本拉起，**不要再手动起第二份**（同一 token 两路连接会互踢或 409）。聊天里 `/restart` 需要 `admin_from`。重启会打断正在跑的回合，先告诉用户。
 
 ## 常用聊天命令（支持前缀匹配）
 
