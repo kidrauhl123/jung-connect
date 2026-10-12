@@ -1617,6 +1617,13 @@ func buildDiscordActionRows(rows [][]core.ButtonOption) []discordgo.MessageCompo
 		if len(row) == 0 {
 			continue
 		}
+		if len(components) >= discordMaxActionRows {
+			slog.Warn("discord: dropping button rows beyond limit", "rows", len(rows), "limit", discordMaxActionRows)
+			break
+		}
+		if len(row) > discordMaxButtonsPerRow {
+			row = row[:discordMaxButtonsPerRow]
+		}
 		buttons := make([]discordgo.MessageComponent, 0, len(row))
 		for idx, btn := range row {
 			style := discordgo.SecondaryButton
@@ -1628,8 +1635,12 @@ func buildDiscordActionRows(rows [][]core.ButtonOption) []discordgo.MessageCompo
 			case 2:
 				style = discordgo.PrimaryButton
 			}
+			label := btn.Text
+			if r := []rune(label); len(r) > discordMaxButtonLabelLen {
+				label = string(r[:discordMaxButtonLabelLen-1]) + "…"
+			}
 			buttons = append(buttons, discordgo.Button{
-				Label:    btn.Text,
+				Label:    label,
 				Style:    style,
 				CustomID: btn.Data,
 			})
@@ -1637,6 +1648,19 @@ func buildDiscordActionRows(rows [][]core.ButtonOption) []discordgo.MessageCompo
 		components = append(components, discordgo.ActionsRow{Components: buttons})
 	}
 	return components
+}
+
+// Discord message component limits.
+const (
+	discordMaxActionRows     = 5
+	discordMaxButtonsPerRow  = 5
+	discordMaxButtonLabelLen = 80
+)
+
+// ButtonLayoutLimits reports Discord's action-row limits so core menus can
+// paginate instead of producing a 400 Invalid Form Body.
+func (p *Platform) ButtonLayoutLimits() (int, int) {
+	return discordMaxActionRows, discordMaxButtonsPerRow
 }
 
 func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string, buttons [][]core.ButtonOption) error {
@@ -1682,6 +1706,7 @@ func (p *progressPlatform) ProgressUpdateInterval() time.Duration {
 var _ core.ImageSender = (*Platform)(nil)
 var _ core.FileSender = (*Platform)(nil)
 var _ core.InlineButtonSender = (*Platform)(nil)
+var _ core.ButtonLayoutLimits = (*Platform)(nil)
 var _ core.TypingIndicator = (*Platform)(nil)
 var _ core.TypingIndicatorDone = (*Platform)(nil)
 var _ core.TypingIndicatorFail = (*Platform)(nil)

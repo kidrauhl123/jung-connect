@@ -300,6 +300,13 @@ type InlineButtonSender interface {
 	SendWithButtons(ctx context.Context, replyCtx any, content string, buttons [][]ButtonOption) error
 }
 
+// ButtonLayoutLimits is optionally implemented by InlineButtonSender
+// platforms with hard component limits (e.g. Discord: 5 rows x 5 buttons).
+// Menus that may exceed them (the /model list) paginate accordingly.
+type ButtonLayoutLimits interface {
+	ButtonLayoutLimits() (maxRows, maxPerRow int)
+}
+
 // CardSender is an optional interface for platforms that support sending
 // structured rich cards (e.g. Feishu Interactive Card). Platforms that do not
 // implement this interface will receive a plain-text fallback via Card.RenderText().
