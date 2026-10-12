@@ -32,6 +32,7 @@ func init() {
 //   - "full-auto": --sandbox workspace-write + approval_policy=never
 //   - "yolo":      --dangerously-bypass-approvals-and-sandbox
 type Agent struct {
+	core.PendingSessionModel
 	workDir         string
 	model           string
 	reasoningEffort string
@@ -478,6 +479,9 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 	provName, provAPIKey, provWireAPI, provHeaders := a.activeProviderCodexConfig()
 	a.mu.Unlock()
+	if m := a.TakeSessionModel(); m != "" {
+		model = m
+	}
 
 	if provName != "" {
 		if err := ensureCodexProviderConfig(codexHome, provName, baseURL, provWireAPI, provHeaders); err != nil {

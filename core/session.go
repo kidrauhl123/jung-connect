@@ -37,6 +37,11 @@ type Session struct {
 	// in-memory active provider does not). Empty means "no explicit choice
 	// — use whatever the agent's default is".
 	ActiveProvider string         `json:"active_provider,omitempty"`
+	// ModelOverride is the per-session model chosen with `/model <x>` (without
+	// --global). It is applied at StartSession and wins over the channel
+	// profile model and the agent's global default. Cleared on /new and reset;
+	// survives /config reload and process restarts.
+	ModelOverride string `json:"model_override,omitempty"`
 	History        []HistoryEntry `json:"history"`
 	CreatedAt      time.Time      `json:"created_at"`
 	UpdatedAt      time.Time      `json:"updated_at"`
@@ -213,6 +218,20 @@ func (s *Session) SetActiveProvider(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ActiveProvider = name
+}
+
+// SetModelOverride atomically sets the per-session model override.
+func (s *Session) SetModelOverride(model string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ModelOverride = strings.TrimSpace(model)
+}
+
+// GetModelOverride atomically reads the per-session model override.
+func (s *Session) GetModelOverride() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ModelOverride
 }
 
 // GetActiveProvider atomically reads the provider name the user last
@@ -693,6 +712,8 @@ func (sm *SessionManager) saveLocked() {
 			// restart; otherwise a /switch followed by a crash would lose the
 			// exemption and the next message after restart would be rotated.
 			ExplicitActivatedAt: s.ExplicitActivatedAt,
+			// Per-session /model choice must survive restarts and reloads.
+			ModelOverride: s.ModelOverride,
 		}
 		s.mu.Unlock()
 	}

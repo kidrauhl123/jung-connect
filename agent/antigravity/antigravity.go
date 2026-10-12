@@ -30,6 +30,7 @@ func init() {
 //   - "yolo":      auto-approve all tools (--dangerously-skip-permissions)
 //   - "plan":      read-only plan mode with terminal sandbox constraints (--sandbox)
 type Agent struct {
+	core.PendingSessionModel
 	workDir      string
 	model        string
 	mode         string
@@ -239,6 +240,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		}
 	}
 	a.mu.Unlock()
+
+	if m := a.TakeSessionModel(); m != "" {
+		model = m
+	}
 
 	return newAntigravitySession(ctx, cmd, extraArgs, workDir, model, mode, sessionID, extraEnv, timeout)
 }

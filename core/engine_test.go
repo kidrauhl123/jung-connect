@@ -4702,7 +4702,7 @@ func TestCmdModel_UpdatesActiveProviderModel(t *testing.T) {
 	s := e.sessions.GetOrCreateActive(msg.SessionKey)
 	s.SetAgentSessionID("existing-session", "test")
 
-	e.cmdModel(p, msg, []string{"switch", "gpt"})
+	e.cmdModel(p, msg, []string{"--global", "switch", "gpt"})
 
 	if agent.model != "gpt-4.1" {
 		t.Fatalf("agent model = %q, want gpt-4.1", agent.model)
@@ -4727,7 +4727,7 @@ func TestCmdModel_DirectNameDoesNotNeedModelListMatch(t *testing.T) {
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
 	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
 
-	e.cmdModel(p, msg, []string{"switch", "custom/provider-model"})
+	e.cmdModel(p, msg, []string{"--global", "switch", "custom/provider-model"})
 
 	if agent.model != "custom/provider-model" {
 		t.Fatalf("agent model = %q, want custom/provider-model", agent.model)
@@ -4743,7 +4743,7 @@ func TestCmdModel_AliasWithPunctuationStillResolves(t *testing.T) {
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
 	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
 
-	e.cmdModel(p, msg, []string{"switch", "gpt-4.1"})
+	e.cmdModel(p, msg, []string{"--global", "switch", "gpt-4.1"})
 
 	if agent.model != "openai/gpt-4.1" {
 		t.Fatalf("agent model = %q, want openai/gpt-4.1", agent.model)
@@ -4759,7 +4759,7 @@ func TestCmdModel_AliasStillResolvesOnColdStart(t *testing.T) {
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
 	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
 
-	e.cmdModel(p, msg, []string{"switch", "gpt"})
+	e.cmdModel(p, msg, []string{"--global", "switch", "gpt"})
 
 	if agent.model != "gpt-4.1" {
 		t.Fatalf("agent model = %q, want gpt-4.1", agent.model)
@@ -4772,7 +4772,7 @@ func TestCmdModel_LegacySyntaxStillWorks(t *testing.T) {
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
 	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
 
-	e.cmdModel(p, msg, []string{"gpt"})
+	e.cmdModel(p, msg, []string{"--global", "gpt"})
 
 	if agent.model != "gpt-4.1" {
 		t.Fatalf("agent model = %q, want gpt-4.1", agent.model)
@@ -4800,7 +4800,7 @@ func TestCmdModel_SavesModelWhenNoActiveProvider(t *testing.T) {
 	})
 
 	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
-	e.cmdModel(p, msg, []string{"switch", "gpt"})
+	e.cmdModel(p, msg, []string{"--global", "switch", "gpt"})
 
 	if agent.model != "gpt-4.1" {
 		t.Fatalf("agent model = %q, want gpt-4.1", agent.model)
@@ -4832,7 +4832,7 @@ func TestCmdModel_DoesNotClaimSuccessWhenModelSaveFails(t *testing.T) {
 	s.SetAgentSessionID("existing-session", "test")
 	s.AddHistory("user", "keep me")
 
-	e.cmdModel(p, msg, []string{"switch", "gpt"})
+	e.cmdModel(p, msg, []string{"--global", "switch", "gpt"})
 
 	if agent.model != "gpt-4.1-mini" {
 		t.Fatalf("agent model = %q, want unchanged gpt-4.1-mini", agent.model)
@@ -4877,7 +4877,7 @@ func TestCmdModel_MultiWorkspaceUsesWorkspaceAgentAndSessions(t *testing.T) {
 	wsSession := ws.sessions.GetOrCreateActive(msg.SessionKey)
 	wsSession.SetAgentSessionID("workspace-session", "test")
 
-	e.cmdModel(p, msg, []string{"switch", "gpt"})
+	e.cmdModel(p, msg, []string{"--global", "switch", "gpt"})
 
 	if wsAgent.model != "gpt-4.1" {
 		t.Fatalf("workspace agent model = %q, want gpt-4.1", wsAgent.model)
@@ -4937,7 +4937,7 @@ func TestCmdModel_MultiWorkspaceSwitchUpdatesRuntimeProviderModelWithoutConfigSa
 
 	msg := &Message{SessionKey: "feishu:" + channelID + ":u1", ReplyCtx: "ctx"}
 
-	e.cmdModel(p, msg, []string{"switch", "gpt"})
+	e.cmdModel(p, msg, []string{"--global", "switch", "gpt"})
 
 	if wsAgent.model != "gpt-4.1" {
 		t.Fatalf("workspace agent model = %q, want gpt-4.1", wsAgent.model)
@@ -5021,7 +5021,7 @@ func TestCmdModel_MultiWorkspaceIsolationBetweenWorkspacesAndGlobal(t *testing.T
 	fbWS.sessions = NewSessionManager("")
 
 	boundMsg := &Message{SessionKey: "feishu:" + boundChannel + ":u1", ReplyCtx: "ctx", ChannelKey: boundChannel, Platform: "feishu"}
-	e.cmdModel(p, boundMsg, []string{"switch", "gpt"})
+	e.cmdModel(p, boundMsg, []string{"--global", "switch", "gpt"})
 
 	if boundAgent.model != "gpt-4.1" {
 		t.Fatalf("bound workspace model = %q, want gpt-4.1", boundAgent.model)
@@ -5047,7 +5047,7 @@ func TestCmdModel_MultiWorkspaceIsolationBetweenWorkspacesAndGlobal(t *testing.T
 
 	// Switch model on unbound/fallback topic — must not affect bound workspace or global.
 	fbMsg := &Message{SessionKey: "feishu:C-general:u1", ReplyCtx: "ctx", ChannelKey: "C-general", Platform: "feishu"}
-	e.cmdModel(p, fbMsg, []string{"switch", "gpt-4.1-mini"})
+	e.cmdModel(p, fbMsg, []string{"--global", "switch", "gpt-4.1-mini"})
 
 	if fbAgent.model != "gpt-4.1-mini" {
 		t.Fatalf("fallback workspace model = %q, want gpt-4.1-mini", fbAgent.model)
@@ -5111,7 +5111,7 @@ func TestCmdModel_MultiWorkspacePersistsWorkspaceModelForRecreatedAgent(t *testi
 	e.workspaceBindings.Bind("project:test", channelID, "chan", wsDir)
 	msg := &Message{SessionKey: "feishu:" + channelID + ":u1", ReplyCtx: "ctx"}
 
-	e.cmdModel(p, msg, []string{"switch", "gpt"})
+	e.cmdModel(p, msg, []string{"--global", "switch", "gpt"})
 
 	if savedModel != "" {
 		t.Fatalf("global model save called with %q, want no config save for workspace switch", savedModel)
@@ -5161,7 +5161,7 @@ func TestCmdModel_KeepHistoryPreservesSessionID(t *testing.T) {
 	s.SetAgentSessionID("existing-session-id", "test")
 	s.AddHistory("user", "hello")
 
-	e.cmdModel(p, msg, []string{"switch", "gpt"})
+	e.cmdModel(p, msg, []string{"--global", "switch", "gpt"})
 
 	if got := s.GetAgentSessionID(); got != "existing-session-id" {
 		t.Fatalf("session id = %q, want existing-session-id (should be preserved)", got)
@@ -9764,7 +9764,7 @@ func TestHandleCardNav_ModelSwitchesAndRefreshesCard(t *testing.T) {
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
 
 	sessionKey := "feishu:channel1:user1"
-	card := e.handleCardNav("act:/model new-model", sessionKey)
+	card := e.handleCardNav("act:/model --global new-model", sessionKey)
 	if card == nil {
 		t.Fatal("expected immediate result card")
 	}
@@ -9808,7 +9808,7 @@ func TestHandleCardNav_ModelUsesWorkspaceContext(t *testing.T) {
 	wsSession := ws.sessions.GetOrCreateActive(sessionKey)
 	wsSession.SetAgentSessionID("workspace-session", "test")
 
-	card := e.handleCardNav("act:/model switch 1", sessionKey)
+	card := e.handleCardNav("act:/model --global switch 1", sessionKey)
 	if card == nil {
 		t.Fatal("expected immediate result card")
 	}
@@ -9840,7 +9840,7 @@ func TestHandleCardNav_ModelSwitchFailureRefreshesCard(t *testing.T) {
 	e.modelSaveFunc = func(string) error { return errors.New("save failed") }
 
 	sessionKey := "feishu:channel1:user1"
-	card := e.handleCardNav("act:/model broken-model", sessionKey)
+	card := e.handleCardNav("act:/model --global broken-model", sessionKey)
 	if card == nil {
 		t.Fatal("expected immediate failure card")
 	}

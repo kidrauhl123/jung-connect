@@ -4221,9 +4221,15 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		channelSP = e.buildChannelSessionProfile(cp, workDir)
 	}
 	channelInjector, channelNative := agent.(ChannelProfileInjector)
+	sessionModel := session.GetModelOverride()
 	stageChannelProfile := func() {
 		if channelNative {
 			channelInjector.SetChannelProfile(channelSP)
+		}
+		// Per-session /model override (wins over channel and global model).
+		// Always staged ("" clears) so a stale value never leaks.
+		if sms, ok := agent.(SessionModelSetter); ok {
+			sms.SetSessionModel(sessionModel)
 		}
 	}
 	stageChannelProfile()
@@ -7254,6 +7260,7 @@ func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
 	// Clear old session's agent session ID so it cannot be resumed
 	old := sessions.GetOrCreateActive(msg.SessionKey)
 	old.SetAgentSessionID("", "")
+	old.SetModelOverride("")
 	old.ClearHistory()
 	sessions.Save()
 
@@ -9958,6 +9965,8 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 		return
 	}
 
+	args, global := splitModelGlobalFlag(args)
+
 	// Two-level vendor menu: `/model vendor <key>` shows models in that vendor.
 	if len(args) >= 1 && strings.EqualFold(strings.TrimSpace(args[0]), "vendor") {
 		vendorKey := ""
@@ -9995,12 +10004,29 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 		target = resolveModelSwitchTarget(target, models)
 	}
 
+	if !global {
+		if _, ok := agent.(SessionModelSetter); !ok {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgModelSessionNotSupported))
+			return
+		}
+		sessions.GetOrCreateActive(msg.SessionKey).SetModelOverride(target)
+		e.cleanupInteractiveState(interactiveKey)
+		// Keep the agent session ID: the next StartSession resumes the same
+		// conversation with the per-session model.
+		sessions.Save()
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgModelChangedSession, target))
+		return
+	}
+
 	target, err = e.switchModelOnAgent(agent, target, e.shouldPersistModelConfig(agent))
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgModelChangeFailed, err))
 		return
 	}
 	e.persistWorkspaceModelOverride(interactiveKey, msg.SessionKey, agent, target)
+	// A global switch also drops this session's own override so the new
+	// default takes effect here too.
+	sessions.GetOrCreateActive(msg.SessionKey).SetModelOverride("")
 	e.cleanupInteractiveState(interactiveKey)
 
 	// Keep the existing agent session ID so the next StartSession uses
@@ -10026,7 +10052,9 @@ func (e *Engine) replyModelVendorButtons(p Platform, msg *Message, switcher Mode
 		sb.WriteString(e.i18n.Tf(MsgModelCurrent, current))
 		sb.WriteString("\n")
 	}
-	sb.WriteString("\n")
+	_, scopeSessions := e.sessionContextForKey(msg.SessionKey)
+	sb.WriteString(e.modelScopesLine(msg.SessionKey, switcher, scopeSessions))
+	sb.WriteString("\n\n")
 
 	groups := GroupModelsByVendor(models)
 	var buttons [][]ButtonOption
@@ -10144,6 +10172,47 @@ func modelSwitchNeedsLookup(input string) bool {
 		return true
 	}
 	return !strings.Contains(input, "/")
+}
+
+// splitModelGlobalFlag removes --global / -g from /model arguments and
+// reports whether it was present.
+func splitModelGlobalFlag(args []string) ([]string, bool) {
+	out := make([]string, 0, len(args))
+	global := false
+	for _, a := range args {
+		switch strings.ToLower(strings.TrimSpace(a)) {
+		case "--global", "-g":
+			global = true
+		default:
+			out = append(out, a)
+		}
+	}
+	return out, global
+}
+
+// modelScopesLine renders the session / channel / global models for
+// sessionKey, e.g. "Session: x | Channel: - | Global: y".
+func (e *Engine) modelScopesLine(sessionKey string, switcher ModelSwitcher, sessions *SessionManager) string {
+	unset := e.i18n.T(MsgModelScopeUnset)
+	orUnset := func(v string) string {
+		if strings.TrimSpace(v) == "" {
+			return unset
+		}
+		return v
+	}
+	sessionModel := ""
+	if sessions != nil && sessionKey != "" {
+		if id := sessions.ActiveSessionID(sessionKey); id != "" {
+			if s := sessions.FindByID(id); s != nil {
+				sessionModel = s.GetModelOverride()
+			}
+		}
+	}
+	channelModel := ""
+	if sessionKey != "" {
+		channelModel = e.effectiveChannelModel(e.channelProfileForSessionKey(sessionKey))
+	}
+	return e.i18n.Tf(MsgModelScopes, orUnset(sessionModel), orUnset(channelModel), orUnset(switcher.GetModel()))
 }
 
 func parseModelSwitchArgs(args []string) (string, bool) {
@@ -11171,6 +11240,7 @@ func (e *Engine) cmdProviderRemove(p Platform, msg *Message, switcher ProviderSw
 func (e *Engine) resetAllSessions() {
 	for _, s := range e.sessions.AllSessions() {
 		s.SetAgentSessionID("", "")
+		s.SetModelOverride("")
 		s.ClearHistory()
 	}
 	e.sessions.Save()
@@ -12485,7 +12555,7 @@ func (e *Engine) handleModelCardAction(args, sessionKey string) *Card {
 		return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", e.i18n.T(MsgModelNotSupported))
 	}
 
-	fields := strings.Fields(args)
+	fields, global := splitModelGlobalFlag(strings.Fields(args))
 	if len(fields) >= 1 && strings.EqualFold(fields[0], "vendor") {
 		vendorKey := ""
 		if len(fields) >= 2 {
@@ -12506,10 +12576,25 @@ func (e *Engine) handleModelCardAction(args, sessionKey string) *Card {
 		cancel()
 	}
 
-	resolved, err := e.switchModelOnAgent(agent, target, e.shouldPersistModelConfig(agent))
 	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
+	if !global {
+		if _, ok := agent.(SessionModelSetter); !ok {
+			return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", e.i18n.T(MsgModelSessionNotSupported))
+		}
+		sessions.GetOrCreateActive(sessionKey).SetModelOverride(target)
+		e.cleanupInteractiveState(interactiveKey)
+		sessions.Save()
+		return NewCard().
+			Title(e.i18n.T(MsgCardTitleModel), "green").
+			Markdown(e.i18n.Tf(MsgModelChangedSession, target)).
+			Buttons(e.modelCardBackButton()).
+			Build()
+	}
+
+	resolved, err := e.switchModelOnAgent(agent, target, e.shouldPersistModelConfig(agent))
 	if err == nil {
 		e.persistWorkspaceModelOverride(interactiveKey, sessionKey, agent, resolved)
+		sessions.GetOrCreateActive(sessionKey).SetModelOverride("")
 	}
 	e.cleanupInteractiveState(interactiveKey)
 	if err == nil {
@@ -13379,6 +13464,13 @@ func (e *Engine) renderModelCard(sessionKey string, vendorKey string) *Card {
 		sb.WriteString(e.i18n.T(MsgModelDefault))
 	} else {
 		sb.WriteString(e.i18n.Tf(MsgModelCurrent, current))
+	}
+	if sessionKey != "" {
+		_, scopeSessions := e.sessionContextForKey(sessionKey)
+		if !strings.HasSuffix(sb.String(), "\n") {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(e.modelScopesLine(sessionKey, switcher, scopeSessions))
 	}
 
 	// Level 1: vendor list
@@ -16331,6 +16423,12 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 	// Use the engine context (not the relay timeout context) so that the
 	// agent process is not killed when the relay deadline fires. The relay
 	// timeout only controls how long we *wait* for the response.
+	stageRelayModel := func() {
+		if sms, ok := agent.(SessionModelSetter); ok {
+			sms.SetSessionModel(session.GetModelOverride())
+		}
+	}
+	stageRelayModel()
 	agentSession, err := agent.StartSession(e.ctx, session.GetAgentSessionID())
 	if err != nil {
 		// Resume failed — fall back to a fresh session so the relay is not
