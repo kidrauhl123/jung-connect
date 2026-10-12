@@ -9965,7 +9965,13 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 			vendorKey = strings.TrimSpace(args[1])
 		}
 		if !supportsCards(p) {
-			e.replyModelVendorButtons(p, msg, switcher, vendorKey)
+			page := 1
+			if len(args) >= 3 {
+				if n, err := strconv.Atoi(strings.TrimSpace(args[2])); err == nil && n > 0 {
+					page = n
+				}
+			}
+			e.replyModelVendorButtonsPage(p, msg, switcher, vendorKey, page)
 			return
 		}
 		e.replyWithCard(p, msg.ReplyCtx, e.renderModelCard(msg.SessionKey, vendorKey))
@@ -10014,6 +10020,15 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 // replyModelVendorButtons renders the Telegram (button) two-level /model menu.
 // vendorKey empty → vendor list; otherwise models in that vendor + Back.
 func (e *Engine) replyModelVendorButtons(p Platform, msg *Message, switcher ModelSwitcher, vendorKey string) {
+	e.replyModelVendorButtonsPage(p, msg, switcher, vendorKey, 1)
+}
+
+// replyModelVendorButtonsPage renders the vendor list, or one page of a
+// vendor's models. Platforms that implement ButtonLayoutLimits (Discord: at
+// most 5 action rows x 5 buttons, 2000-char content) get the model list
+// paginated so the message is accepted; unlimited platforms get everything on
+// one page as before.
+func (e *Engine) replyModelVendorButtonsPage(p Platform, msg *Message, switcher ModelSwitcher, vendorKey string, page int) {
 	fetchCtx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
 	defer cancel()
 	models := switcher.AvailableModels(fetchCtx)
@@ -10072,10 +10087,37 @@ func (e *Engine) replyModelVendorButtons(p Platform, msg *Message, switcher Mode
 		return
 	}
 
-	sb.WriteString(fmt.Sprintf("%s\n\n", group.Label))
+	indices := group.Indices
+	perRow := 2
+	totalPages := 1
+	if lim, ok := p.(ButtonLayoutLimits); ok {
+		maxRows, maxPerRow := lim.ButtonLayoutLimits()
+		if maxPerRow > 0 {
+			perRow = min(4, maxPerRow)
+		}
+		if maxRows > 1 {
+			// Reserve one row for prev / next / back navigation.
+			pageSize := (maxRows - 1) * perRow
+			totalPages = (len(indices) + pageSize - 1) / pageSize
+			if page > totalPages {
+				page = totalPages
+			}
+			if page < 1 {
+				page = 1
+			}
+			start := (page - 1) * pageSize
+			end := min(start+pageSize, len(indices))
+			indices = indices[start:end]
+		}
+	}
+	if totalPages > 1 {
+		sb.WriteString(fmt.Sprintf("%s (%d/%d)\n\n", group.Label, page, totalPages))
+	} else {
+		sb.WriteString(fmt.Sprintf("%s\n\n", group.Label))
+	}
 	sb.WriteString(e.i18n.T(MsgModelListTitle))
 	var row []ButtonOption
-	for _, i := range group.Indices {
+	for _, i := range indices {
 		m := models[i]
 		marker := "  "
 		if m.Name == current {
@@ -10093,7 +10135,7 @@ func (e *Engine) replyModelVendorButtons(p Platform, msg *Message, switcher Mode
 			label = "▶ " + label
 		}
 		row = append(row, ButtonOption{Text: label, Data: fmt.Sprintf("cmd:/model switch %d", i+1)})
-		if len(row) >= 2 {
+		if len(row) >= perRow {
 			buttons = append(buttons, row)
 			row = nil
 		}
@@ -10101,7 +10143,15 @@ func (e *Engine) replyModelVendorButtons(p Platform, msg *Message, switcher Mode
 	if len(row) > 0 {
 		buttons = append(buttons, row)
 	}
-	buttons = append(buttons, []ButtonOption{{Text: e.i18n.T(MsgModelVendorBack), Data: "cmd:/model"}})
+	var nav []ButtonOption
+	if page > 1 {
+		nav = append(nav, ButtonOption{Text: "◀", Data: fmt.Sprintf("cmd:/model vendor %s %d", group.Key, page-1)})
+	}
+	if page < totalPages {
+		nav = append(nav, ButtonOption{Text: "▶", Data: fmt.Sprintf("cmd:/model vendor %s %d", group.Key, page+1)})
+	}
+	nav = append(nav, ButtonOption{Text: e.i18n.T(MsgModelVendorBack), Data: "cmd:/model"})
+	buttons = append(buttons, nav)
 	sb.WriteString("\n")
 	sb.WriteString(e.i18n.T(MsgModelUsage))
 	e.replyWithButtons(p, msg.ReplyCtx, sb.String(), buttons)
@@ -12314,9 +12364,12 @@ func (e *Engine) replyWithButtons(p Platform, replyCtx any, content string, butt
 		return
 	}
 	if bs, ok := p.(InlineButtonSender); ok {
-		if err := bs.SendWithButtons(e.ctx, replyCtx, content, buttons); err == nil {
+		err := bs.SendWithButtons(e.ctx, replyCtx, content, buttons)
+		if err == nil {
 			return
 		}
+		slog.Warn("send with buttons failed, falling back to plain text",
+			"platform", p.Name(), "rows", len(buttons), "content_len", len(content), "error", err)
 	}
 	e.reply(p, replyCtx, content)
 }

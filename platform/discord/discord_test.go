@@ -2328,3 +2328,25 @@ func basePlatformFor(t *testing.T, pAny core.Platform) *Platform {
 		return nil
 	}
 }
+
+func TestBuildDiscordActionRows_EnforcesLimits(t *testing.T) {
+	var rows [][]core.ButtonOption
+	for i := 0; i < 8; i++ {
+		var r []core.ButtonOption
+		for j := 0; j < 7; j++ {
+			r = append(r, core.ButtonOption{Text: strings.Repeat("x", 100), Data: "d"})
+		}
+		rows = append(rows, r)
+	}
+	comps := buildDiscordActionRows(rows)
+	if len(comps) != discordMaxActionRows {
+		t.Fatalf("rows = %d", len(comps))
+	}
+	row := comps[0].(discordgo.ActionsRow)
+	if len(row.Components) != discordMaxButtonsPerRow {
+		t.Fatalf("buttons per row = %d", len(row.Components))
+	}
+	if l := len([]rune(row.Components[0].(discordgo.Button).Label)); l > discordMaxButtonLabelLen {
+		t.Fatalf("label len = %d", l)
+	}
+}
