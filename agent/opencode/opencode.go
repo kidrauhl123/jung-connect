@@ -29,6 +29,7 @@ func init() {
 //   - "default": standard mode
 //   - "yolo":    auto mode (opencode run is auto by default in non-interactive mode)
 type Agent struct {
+	core.PendingSessionModel
 	workDir              string
 	model                string
 	mode                 string
@@ -543,6 +544,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		}
 	}
 	a.mu.Unlock()
+
+	if m := a.TakeSessionModel(); m != "" {
+		model = m
+	}
 
 	return newOpencodeSession(ctx, cmd, extraArgs, workDir, model, mode, reasoningEffort, agentName, sessionID, extraEnv)
 }

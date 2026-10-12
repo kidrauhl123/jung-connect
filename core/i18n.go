@@ -373,6 +373,10 @@ const (
 	MsgModelDefault               MsgKey = "model_default"
 	MsgModelListTitle             MsgKey = "model_list_title"
 	MsgModelUsage                 MsgKey = "model_usage"
+	MsgModelChangedSession        MsgKey = "model_changed_session"
+	MsgModelScopes                MsgKey = "model_scopes"
+	MsgModelScopeUnset            MsgKey = "model_scope_unset"
+	MsgModelSessionNotSupported   MsgKey = "model_session_not_supported"
 	MsgReasoningDefault           MsgKey = "reasoning_default"
 	MsgReasoningListTitle         MsgKey = "reasoning_list_title"
 	MsgReasoningUsage             MsgKey = "reasoning_usage"
@@ -2525,11 +2529,39 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "Modelos disponibles:\n",
 	},
 	MsgModelUsage: {
-		LangEnglish:            "Usage: `/model switch <number>` or `/model switch <model_name>`",
-		LangChinese:            "用法: `/model switch <序号>` 或 `/model switch <模型名>`",
-		LangTraditionalChinese: "用法: `/model switch <序號>` 或 `/model switch <模型名>`",
-		LangJapanese:           "使い方: `/model switch <番号>` または `/model switch <モデル名>`",
-		LangSpanish:            "Uso: `/model switch <número>` o `/model switch <nombre_modelo>`",
+		LangEnglish:            "Usage: `/model switch <number>` or `/model switch <model_name>` (current session only); add `--global` (`-g`) to change the default for all future sessions",
+		LangChinese:            "用法: `/model switch <序号>` 或 `/model switch <模型名>`（仅当前会话）；加 `--global`（`-g`）修改后续所有会话的默认模型",
+		LangTraditionalChinese: "用法: `/model switch <序號>` 或 `/model switch <模型名>`（僅當前會話）；加 `--global`（`-g`）修改後續所有會話的預設模型",
+		LangJapanese:           "使い方: `/model switch <番号>` または `/model switch <モデル名>`（現在のセッションのみ）。`--global`（`-g`）を付けると今後の全セッションの既定を変更します",
+		LangSpanish:            "Uso: `/model switch <número>` o `/model switch <nombre_modelo>` (solo esta sesión); añade `--global` (`-g`) para cambiar el predeterminado de las futuras sesiones",
+	},
+	MsgModelChangedSession: {
+		LangEnglish:            "Model switched to `%s` for this session only. Use `/model --global <model>` to change the default for all future sessions.",
+		LangChinese:            "当前会话的模型已切换为 `%s`（仅本会话）。如需修改后续所有会话的默认模型，请用 `/model --global <模型>`。",
+		LangTraditionalChinese: "當前會話的模型已切換為 `%s`（僅本會話）。如需修改後續所有會話的預設模型，請用 `/model --global <模型>`。",
+		LangJapanese:           "このセッションのみモデルを `%s` に切り替えました。今後の全セッションの既定を変えるには `/model --global <モデル>` を使ってください。",
+		LangSpanish:            "Modelo cambiado a `%s` solo para esta sesión. Usa `/model --global <modelo>` para cambiar el predeterminado de las futuras sesiones.",
+	},
+	MsgModelScopes: {
+		LangEnglish:            "Session: %s | Channel: %s | Global: %s",
+		LangChinese:            "会话: %s | 频道: %s | 全局: %s",
+		LangTraditionalChinese: "會話: %s | 頻道: %s | 全域: %s",
+		LangJapanese:           "セッション: %s | チャンネル: %s | グローバル: %s",
+		LangSpanish:            "Sesión: %s | Canal: %s | Global: %s",
+	},
+	MsgModelScopeUnset: {
+		LangEnglish:            "-",
+		LangChinese:            "-",
+		LangTraditionalChinese: "-",
+		LangJapanese:           "-",
+		LangSpanish:            "-",
+	},
+	MsgModelSessionNotSupported: {
+		LangEnglish:            "This agent cannot switch the model per session; use `/model --global <model>`.",
+		LangChinese:            "该 Agent 不支持按会话切换模型，请使用 `/model --global <模型>`。",
+		LangTraditionalChinese: "該 Agent 不支援按會話切換模型，請使用 `/model --global <模型>`。",
+		LangJapanese:           "このエージェントはセッション単位のモデル切替に対応していません。`/model --global <モデル>` を使ってください。",
+		LangSpanish:            "Este agente no puede cambiar el modelo por sesión; usa `/model --global <modelo>`.",
 	},
 	MsgReasoningDefault: {
 		LangEnglish:            "Current reasoning effort: (not set, using Codex default)\n",

@@ -30,6 +30,7 @@ func init() {
 //   - "yolo":      auto-approve all tools (-y / --approval-mode yolo)
 //   - "plan":      read-only plan mode (--approval-mode plan)
 type Agent struct {
+	core.PendingSessionModel
 	workDir      string
 	model        string
 	mode         string
@@ -222,6 +223,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		}
 	}
 	a.mu.Unlock()
+
+	if m := a.TakeSessionModel(); m != "" {
+		model = m
+	}
 
 	return newGeminiSession(ctx, cmd, extraArgs, workDir, model, mode, sessionID, extraEnv, timeout)
 }

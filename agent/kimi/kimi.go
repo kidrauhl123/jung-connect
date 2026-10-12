@@ -39,6 +39,7 @@ func init() {
 //   - "quiet":   final-message-only; uses --quiet on legacy kimi-cli, local
 //     event suppression on the Kimi Code CLI (which dropped --quiet, #1561)
 type Agent struct {
+	core.PendingSessionModel
 	workDir      string
 	model        string
 	mode         string
@@ -188,6 +189,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		}
 	}
 	a.mu.Unlock()
+
+	if m := a.TakeSessionModel(); m != "" {
+		model = m
+	}
 
 	return newKimiSession(ctx, cmd, extraArgs, workDir, model, mode, sessionID, extraEnv, timeout, flagSupport)
 }

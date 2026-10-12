@@ -25,6 +25,7 @@ func init() {
 
 // Agent runs an ACP (Agent Client Protocol) agent subprocess over stdio JSON-RPC.
 type Agent struct {
+	core.PendingSessionModel
 	workDir      string
 	cmd          string
 	cliExtraArgs []string // extra args from cmd, prepended before args
@@ -331,6 +332,9 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		}
 	}
 
+	if m := a.TakeSessionModel(); m != "" {
+		pendingModel = m
+	}
 	allArgs = injectModelArgs(allArgs, pendingModel)
 	allArgs = injectReasoningEffortArgs(allArgs, pendingEffort)
 

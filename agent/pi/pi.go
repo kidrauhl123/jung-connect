@@ -22,6 +22,7 @@ func init() {
 
 // Agent drives the pi coding agent CLI.
 type Agent struct {
+	core.PendingSessionModel
 	cmd          string   // path to pi binary
 	cliExtraArgs []string // extra args from cmd after the binary name
 	configEnv    []string // env vars from [projects.agent.options.env]
@@ -156,6 +157,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	extraEnv = append(extraEnv, core.InjectedAgentEnv(mode)...)
 	rpc := a.rpc
 	a.mu.Unlock()
+	if m := a.TakeSessionModel(); m != "" {
+		model = m
+	}
+
 	return newPiSession(ctx, a.cmd, extraArgs, a.workDir, model, mode, thinking, rpc, sessionID, extraEnv)
 }
 

@@ -31,6 +31,7 @@ func init() {
 //   - "plan":      read-only planning mode (--plan)
 //   - "yolo":      auto-approve all tool calls (--yolo)
 type Agent struct {
+	core.PendingSessionModel
 	workDir        string
 	model          string
 	mode           string
@@ -161,6 +162,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		}
 	}
 	a.mu.Unlock()
+
+	if m := a.TakeSessionModel(); m != "" {
+		model = m
+	}
 
 	return newIFlowSession(ctx, cmd, extraArgs, workDir, model, mode, sessionID, extraEnv, toolTimeoutSec)
 }
