@@ -19,6 +19,7 @@ func init() {
 
 // Agent drives Qoder CLI using `qodercli -p <prompt> -f stream-json`.
 type Agent struct {
+	core.PendingSessionModel
 	workDir      string
 	cmd          string   // CLI binary name (default: "qodercli")
 	cliExtraArgs []string // extra args from cmd after the binary name
@@ -118,6 +119,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	extraEnv := append([]string(nil), a.configEnv...)
 	extraEnv = append(extraEnv, a.sessionEnv...)
 	a.mu.Unlock()
+
+	if m := a.TakeSessionModel(); m != "" {
+		model = m
+	}
 
 	return newQoderSession(ctx, cmd, extraArgs, workDir, model, mode, sessionID, extraEnv)
 }

@@ -1395,6 +1395,10 @@ func (m *ManagementServer) handleProjectModel(w http.ResponseWriter, r *http.Req
 	}
 	var body struct {
 		Model string `json:"model"`
+		// SessionKey, when set, switches the model for that session only
+		// (same as `/model <x>` in chat) unless Global is true.
+		SessionKey string `json:"session_key"`
+		Global     bool   `json:"global"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -1404,13 +1408,34 @@ func (m *ManagementServer) handleProjectModel(w http.ResponseWriter, r *http.Req
 		mgmtError(w, http.StatusBadRequest, "model is required")
 		return
 	}
+	if body.SessionKey != "" && !body.Global {
+		if _, ok := e.agent.(SessionModelSetter); !ok {
+			mgmtError(w, http.StatusBadRequest, "agent does not support per-session model switching")
+			return
+		}
+		e.sessions.GetOrCreateActive(body.SessionKey).SetModelOverride(body.Model)
+		e.cleanupInteractiveState(e.interactiveKeyForSessionKey(body.SessionKey))
+		e.sessions.Save()
+		mgmtJSON(w, http.StatusOK, map[string]any{
+			"model":       body.Model,
+			"scope":       "session",
+			"session_key": body.SessionKey,
+			"message":     "session model updated",
+		})
+		return
+	}
 	model, err := e.switchModel(body.Model)
 	if err != nil {
 		mgmtError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if body.SessionKey != "" {
+		e.sessions.GetOrCreateActive(body.SessionKey).SetModelOverride("")
+		e.sessions.Save()
+	}
 	mgmtJSON(w, http.StatusOK, map[string]any{
 		"model":   model,
+		"scope":   "global",
 		"message": "model updated",
 	})
 }

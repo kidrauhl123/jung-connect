@@ -26,6 +26,7 @@ func init() {
 //   - "default":           every tool call requires user approval
 //   - "bypassPermissions": auto-approve everything (alias: yolo)
 type Agent struct {
+	core.PendingSessionModel
 	workDir      string
 	cmd          string   // CLI binary name (default: "copilot")
 	cliExtraArgs []string // extra args from cmd after the binary name
@@ -164,6 +165,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		}
 	}
 	a.mu.RUnlock()
+
+	if m := a.TakeSessionModel(); m != "" {
+		model = m
+	}
 
 	return newCopilotSession(ctx, workDir, cmd, extraArgs, model, mode, sessionID, extraEnv, provider)
 }

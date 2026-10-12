@@ -34,6 +34,7 @@ func init() {
 //   - "auto":              Claude's automatic permission classifier
 //   - "bypassPermissions": auto-approve everything (alias: yolo)
 type Agent struct {
+	core.PendingSessionModel
 	workDir          string
 	cmd              string   // CLI binary name (default: "claude")
 	cliExtraArgs     []string // extra args parsed from cmd (e.g. ["code", "-t", "foo"])
@@ -546,6 +547,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		if e := strings.TrimSpace(channel.ReasoningEffort); e != "" {
 			effort = e
 		}
+	}
+
+	if m := a.TakeSessionModel(); m != "" {
+		model = m
 	}
 
 	return newClaudeSession(ctx, workDir, a.cmd, a.cliExtraArgs, a.cmdArgsFlag, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt, tools, disTools, pluginDirs, extraEnv, platformPrompt, disableVerbose, a.spawnOpts, maxTok, a.ccDataDir, lang)

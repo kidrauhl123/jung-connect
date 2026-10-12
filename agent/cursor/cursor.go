@@ -31,6 +31,7 @@ func init() {
 //   - "plan":     --mode plan (read-only analysis)
 //   - "ask":      --mode ask (Q&A style, read-only)
 type Agent struct {
+	core.PendingSessionModel
 	workDir      string
 	model        string
 	mode         string
@@ -205,6 +206,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		}
 	}
 	a.mu.RUnlock()
+
+	if m := a.TakeSessionModel(); m != "" {
+		model = m
+	}
 
 	return newCursorSession(ctx, cmd, extraArgs, workDir, model, mode, sessionID, extraEnv)
 }
