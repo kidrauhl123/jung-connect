@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 type statusFakePlatform struct {
@@ -103,7 +104,7 @@ func TestStatusMessage_ThrottlesEdits(t *testing.T) {
 	if len(starts) != 1 || len(edits) != 1 {
 		t.Fatalf("starts=%v edits=%v, want 1/1", starts, edits)
 	}
-	if !strings.Contains(edits[0], "3 步") || !strings.Contains(edits[0], "运行 go test ./...") || !strings.Contains(edits[0], "4s") {
+	if !strings.Contains(edits[0], "3 steps") || !strings.Contains(edits[0], "Running go test ./...") || !strings.Contains(edits[0], "4s") {
 		t.Fatalf("edit = %q", edits[0])
 	}
 	// Unchanged content is not re-sent even when the throttle allows it.
@@ -123,19 +124,19 @@ func TestStatusMessage_StuckDetection(t *testing.T) {
 	clk.add(2 * time.Minute)
 	sm.Tick()
 	_, edits, _ := p.snapshot()
-	if strings.Contains(lastOf(edits), "可能卡住") {
+	if strings.Contains(lastOf(edits), "Possibly stuck") {
 		t.Fatalf("stuck too early: %q", lastOf(edits))
 	}
 	clk.add(70 * time.Second)
 	sm.Tick()
 	_, edits, _ = p.snapshot()
-	if !strings.Contains(lastOf(edits), "可能卡住") || !strings.Contains(lastOf(edits), "3m 10s 无进展") {
+	if !strings.Contains(lastOf(edits), "Possibly stuck") || !strings.Contains(lastOf(edits), "3m 10s idle") {
 		t.Fatalf("want stuck marker, got %q", lastOf(edits))
 	}
 	clk.add(2 * time.Second)
 	sm.Tool("edit", `{"file_path":"a.go"}`)
 	_, edits, _ = p.snapshot()
-	if strings.Contains(lastOf(edits), "可能卡住") || !strings.Contains(lastOf(edits), "改 a.go") {
+	if strings.Contains(lastOf(edits), "Possibly stuck") || !strings.Contains(lastOf(edits), "Editing a.go") {
 		t.Fatalf("progress should clear stuck marker: %q", lastOf(edits))
 	}
 }
@@ -148,7 +149,7 @@ func TestStatusMessage_CompletionSummaryAndDelete(t *testing.T) {
 	clk.add(65 * time.Second)
 	sm.Finish(true)
 	_, edits, deletes := p.snapshot()
-	if deletes != 0 || lastOf(edits) != "✅ 完成（2 步，1m 05s）" {
+	if deletes != 0 || lastOf(edits) != "✅ Done (2 steps, 1m 05s)" {
 		t.Fatalf("summary: deletes=%d last=%q", deletes, lastOf(edits))
 	}
 	sm.Finish(true) // idempotent
@@ -167,13 +168,13 @@ func TestStatusMessage_CompletionSummaryAndDelete(t *testing.T) {
 	p3 := &statusFakePlatform{stubPlatformEngine: stubPlatformEngine{n: "fake"}, deleteErr: errors.New("403 missing permissions")}
 	sm3, _ := newTestStatus(t, p3, StatusMessageCfg{OnDone: StatusOnDoneDelete})
 	sm3.Finish(true)
-	if _, e3, _ := p3.snapshot(); !strings.HasPrefix(lastOf(e3), "✅ 完成") {
+	if _, e3, _ := p3.snapshot(); !strings.HasPrefix(lastOf(e3), "✅ Done") {
 		t.Fatalf("fallback summary = %v", e3)
 	}
 	p4 := &statusFakePlatform{stubPlatformEngine: stubPlatformEngine{n: "fake"}}
 	sm4, _ := newTestStatus(t, p4, StatusMessageCfg{OnDone: StatusOnDoneDelete})
 	sm4.Finish(false)
-	if _, e4, d4 := p4.snapshot(); d4 != 0 || !strings.HasPrefix(lastOf(e4), "⏹ 已中断") {
+	if _, e4, d4 := p4.snapshot(); d4 != 0 || !strings.HasPrefix(lastOf(e4), "⏹ Interrupted") {
 		t.Fatalf("interrupted: deletes=%d edits=%v", d4, e4)
 	}
 }
@@ -199,7 +200,7 @@ func TestStatusMessage_NotModifiedAndRateLimit(t *testing.T) {
 	}
 	clk.add(5 * time.Second)
 	sm.Tool("bash", "d")
-	if _, edits, _ := p.snapshot(); len(edits) != 1 || !strings.Contains(edits[0], "运行 d") {
+	if _, edits, _ := p.snapshot(); len(edits) != 1 || !strings.Contains(edits[0], "Running d") {
 		t.Fatalf("after back-off edits = %v", edits)
 	}
 	if !sm.Active() {
@@ -232,20 +233,140 @@ func TestStatusMessage_RenderStaysShort(t *testing.T) {
 }
 
 func TestSummarizeToolStep(t *testing.T) {
-	cases := map[[2]string]string{
-		{"read_file", `{"target_file":"/root/jung-connect/core/upstream.go"}`}: "读 upstream.go",
-		{"Read", `{"file_path":"/a/b/c.txt"}`}:                                 "读 c.txt",
-		{"search_replace", `{"file_path":"x/engine.go"}`}:                      "改 engine.go",
-		{"run_terminal_command", "go test ./...\nmore"}:                        "运行 go test ./...",
-		{"grep", `{"pattern":"isGrokChatModel"}`}:                              "搜索 isGrokChatModel",
-		{"web_fetch", `{"url":"https://example.com"}`}:                         "查网页 https://example.com",
-		{"TodoWrite", `{"todos":[]}`}:                                          "更新计划",
-		{"mystery", ""}:                                                        "mystery",
+	cases := []struct{ name, input, want string }{
+		// grok ACP shapes (from ADA logs)
+		{"read_file", `{"target_file":"/root/jung-connect/core/upstream.go"}`, "📖 Reading upstream.go"},
+		{"read_file", `{"target_file":"/root/JungUI/skills/jungui/SKILL.md"}`, "📖 Reading jungui/SKILL.md"},
+		{"list_dir", `{"target_directory":"/root/JungUI"}`, "📂 Listing JungUI"},
+		{"search_replace", `{"file_path":"x/engine.go"}`, "✏️ Editing engine.go"},
+		{"Execute", "# Check git status\ncd /root/notes && git status", "💻 Running cd /root/notes && git status"},
+		{"Execute", "# Run tests\ngo test ./core\necho done", "💻 Running go test ./core …"},
+		{"grep", `{"path":"/root/notes","pattern":"opencode2api|OpenCode2API","glob":"*.md"}`, `🔍 Searching "opencode2api|OpenCode2API" (*.md)`},
+		{"use_tool", `{"tool_input":{"query":"jasonxu114514 opencode2api pull requests","max_results":8},"tool_name":"jung-search__search","variant":"UseTool"}`, "🌐 Searching web jasonxu114514 opencode2api pull requests"},
+		{"use_tool", `{"tool_input":{"urls":["https://github.com/x/y"]},"tool_name":"jung-search__extract"}`, "🌐 Browsing github.com/x/y"},
+		{"use_tool", `{"tool_input":{"query":"from:github"},"tool_name":"gmail__search_threads"}`, "🔌 gmail·search_threads from:github"},
+		{"use_tool", `{"tool_input":{},"tool_name":"gmail__list_labels"}`, "🔌 gmail·list_labels"},
+		// Claude Code
+		{"Read", `{"file_path":"/a/b/c.txt"}`, "📖 Reading c.txt"},
+		{"Edit", `{"file_path":"/repo/core/engine.go","old_string":"a","new_string":"b"}`, "✏️ Editing engine.go"},
+		{"Bash", `{"command":"go test ./core","description":"Run tests"}`, "💻 Running go test ./core"},
+		{"Glob", `{"pattern":"**/*.go"}`, `🔍 Searching "**/*.go"`},
+		{"WebFetch", `{"url":"https://example.com/docs","prompt":"x"}`, "🌐 Browsing example.com/docs"},
+		{"WebSearch", `{"query":"acp usage_update"}`, "🌐 Searching web acp usage_update"},
+		{"TodoWrite", `{"todos":[]}`, "📝 Updating plan"},
+		{"Task", `{"description":"Explore repo","prompt":"..."}`, "🤖 Subagent Explore repo"},
+		{"mcp__github__get_issue", `{"owner":"a","repo":"b","issue_number":3}`, "🔌 github·get_issue"},
+		{"mcp__exa__web_search_exa", `{"query":"grok cli"}`, "🌐 Searching web grok cli"},
+		// Codex
+		{"exec_command", `{"cmd":"ls -la"}`, "💻 Running ls -la"},
+		{"shell", `{"command":["bash","-lc","make test"]}`, "💻 Running bash -lc make test"},
+		{"apply_patch", "*** Begin Patch\n*** Update File: core/x.go\n@@", "✏️ Editing x.go"},
+		{"update_plan", `{"plan":[]}`, "📝 Updating plan"},
+		// misc
+		{"think", "", "💭 Thinking"},
+		{"mystery", "", "⚙️ mystery"},
+		{"AskUserQuestion", `{"question":"ok?"}`, "⚙️ AskUserQuestion"},
+		{"run_terminal_command", "go test ./...\nmore", "💻 Running go test ./... …"},
+		{"web_fetch", `{"url":"https://example.com"}`, "🌐 Browsing example.com"},
+		// word-based: "tools"/"thread" must not match ls/read
+		{"list_tools", `{}`, "📂 Listing"},
+		{"get_thread", `{"id":"t1"}`, "⚙️ get_thread t1"},
+	}
+	for _, c := range cases {
+		if got := summarizeToolStep(c.name, c.input); got != c.want {
+			t.Errorf("summarizeToolStep(%q, %q) = %q, want %q", c.name, c.input, got, c.want)
+		}
+	}
+}
+
+func TestSummarizeToolStep_TruncatesLongCommands(t *testing.T) {
+	cmd := "go test -tags no_web ./core ./config ./platform/discord ./platform/telegram ./cmd/... -run VeryLongPattern"
+	got := summarizeToolStep("Bash", `{"command":"`+cmd+`"}`)
+	if n := utf8.RuneCountInString(got); n > statusStepMaxRunes {
+		t.Fatalf("len %d > %d: %q", n, statusStepMaxRunes, got)
+	}
+	if !strings.HasPrefix(got, "💻 Running go test -tags no_web") || !strings.HasSuffix(got, "…") {
+		t.Fatalf("got %q", got)
+	}
+	if got := summarizeToolStep("Bash", "{\"command\":\"echo   a\\n\\t  b\"}"); got != "💻 Running echo a …" {
+		t.Fatalf("whitespace: %q", got)
+	}
+}
+
+func TestToolNameWords(t *testing.T) {
+	cases := map[string]string{
+		"WebFetch":         "web fetch",
+		"list_dir":         "list dir",
+		"jung-search":      "jung search",
+		"HTTPRequest":      "http request",
+		"run_terminal_cmd": "run terminal cmd",
+		"NotebookEdit":     "notebook edit",
+		"exec.command":     "exec command",
 	}
 	for in, want := range cases {
-		if got := summarizeToolStep(in[0], in[1]); got != want {
-			t.Errorf("summarizeToolStep(%q,%q) = %q, want %q", in[0], in[1], got, want)
+		if got := strings.Join(toolNameWords(in), " "); got != want {
+			t.Errorf("toolNameWords(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestFormatTokenAndContextUsage(t *testing.T) {
+	tok := map[int]string{0: "0", 950: "950", 1000: "1k", 12345: "12.3k", 500000: "500k", 1234567: "1.2M"}
+	for n, want := range tok {
+		if got := formatTokenCount(n); got != want {
+			t.Errorf("formatTokenCount(%d) = %q, want %q", n, got, want)
+		}
+	}
+	ctx := []struct {
+		used, size int
+		want       string
+	}{
+		{0, 500000, ""},
+		{48000, 500000, "ctx 48k/500k (9%)"},
+		{50000, 500000, "ctx 50k/500k (10%)"},
+		{460000, 500000, "⚠️ ctx 92%"},
+		{400000, 500000, "⚠️ ctx 80%"},
+		{48000, 0, "ctx 48k"},
+	}
+	for _, c := range ctx {
+		if got := formatContextUsage(c.used, c.size); got != c.want {
+			t.Errorf("formatContextUsage(%d,%d) = %q, want %q", c.used, c.size, got, c.want)
+		}
+	}
+}
+
+func TestStatusMessage_UsageHeaderAndDoneTokens(t *testing.T) {
+	p := &statusFakePlatform{stubPlatformEngine: stubPlatformEngine{n: "fake"}}
+	sm, clk := newTestStatus(t, p, StatusMessageCfg{Enabled: true, Interval: time.Second})
+	var usage *ContextUsage
+	sm.SetUsageSource(func() *ContextUsage { return usage })
+	clk.add(2 * time.Second)
+	sm.Tool("read_file", `{"target_file":"/x/engine.go"}`)
+	_, edits, _ := p.snapshot()
+	if strings.Contains(lastOf(edits), "ctx") {
+		t.Fatalf("ctx shown without usage: %q", lastOf(edits))
+	}
+	usage = &ContextUsage{UsedTokens: 50000, ContextWindow: 500000}
+	clk.add(2 * time.Second)
+	sm.Tool("grep", `{"pattern":"x"}`)
+	_, edits, _ = p.snapshot()
+	want := "⏳ Working · 4s · 2 steps · ctx 50k/500k (10%)\n🔍 Searching \"x\""
+	if lastOf(edits) != want {
+		t.Fatalf("header = %q, want %q", lastOf(edits), want)
+	}
+	usage = &ContextUsage{UsedTokens: 460000, ContextWindow: 500000}
+	clk.add(2 * time.Second)
+	sm.Thinking()
+	_, edits, _ = p.snapshot()
+	if !strings.Contains(lastOf(edits), "· ⚠️ ctx 92%\n💭 Thinking") {
+		t.Fatalf("warn header = %q", lastOf(edits))
+	}
+	clk.add(155 * time.Second)
+	sm.SetTurnTokens(12345)
+	sm.Finish(true)
+	_, edits, _ = p.snapshot()
+	if lastOf(edits) != "✅ Done (2 steps, 2m 41s · 12.3k tokens)" {
+		t.Fatalf("done = %q", lastOf(edits))
 	}
 }
 
@@ -310,7 +431,7 @@ func TestProcessInteractiveEvents_StatusMessageReplacesToolMessages(t *testing.T
 	if len(starts) != 1 {
 		t.Fatalf("status starts = %v, want exactly one", starts)
 	}
-	if !strings.HasPrefix(lastOf(edits), "✅ 完成（3 步") {
+	if !strings.HasPrefix(lastOf(edits), "✅ Done (3 steps") {
 		t.Fatalf("final status = %q (edits %v)", lastOf(edits), edits)
 	}
 	sent := p.getSent()
@@ -343,7 +464,7 @@ func TestProcessInteractiveEvents_StatusMessageOffKeepsToolMessages(t *testing.T
 
 	starts, _, _ := p.snapshot()
 	for _, s := range starts {
-		if strings.Contains(s, "处理中") {
+		if strings.Contains(s, "Working") {
 			t.Fatalf("status message sent while disabled: %q", s)
 		}
 	}
@@ -381,7 +502,7 @@ func TestProcessInteractiveEvents_StatusMessageWithStreamPreview(t *testing.T) {
 	}
 	found := false
 	for _, ed := range edits {
-		if strings.HasPrefix(ed, "✅ 完成（2 步") {
+		if strings.HasPrefix(ed, "✅ Done (2 steps") {
 			found = true
 		}
 		if strings.Contains(ed, "🔧") {

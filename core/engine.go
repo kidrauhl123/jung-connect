@@ -5193,6 +5193,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		if sm == nil || !sm.Start() {
 			return
 		}
+		if as := state.agentSession; as != nil {
+			sm.SetUsageSource(func() *ContextUsage { return replyFooterSessionContextUsage(as) })
+		}
 		sm.StartTicker()
 		statusMsg = sm
 		showThinking, showTools, displayMode = false, false, "quiet"
@@ -5939,6 +5942,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			cp.Finalize(ProgressCardStateCompleted)
 			// Close the status message before the final reply is sent so the
 			// reply arrives as a separate, newer message.
+			if event.TotalTokens > 0 {
+				statusMsg.SetTurnTokens(event.TotalTokens)
+			} else {
+				statusMsg.SetTurnTokens(event.InputTokens + event.OutputTokens)
+			}
 			statusMsg.Finish(true)
 			// Use state.agentSession.CurrentSessionID() instead of event.SessionID.
 			// event.SessionID may be empty in some cases, causing the agent_session_id

@@ -29,6 +29,8 @@ type acpSession struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	alive   atomic.Bool
+
+	usage acpUsageState // latest usage_update
 	// loading is set while session/load waits for its result. Grok replays the
 	// whole transcript as session/update notifications before that result.
 	// Emitting them blocks this read loop — nothing consumes events until
@@ -477,6 +479,7 @@ func (s *acpSession) onNotification(method string, params json.RawMessage) {
 	}
 	s.cacheToolCallInput(params)
 	s.maybeAbsorbCurrentModeUpdate(params)
+	s.maybeAbsorbUsageUpdate(params)
 	sid := s.currentACPSessionID()
 	// Debug log to capture raw session/update JSON for troubleshooting vendor compatibility
 	slog.Debug("acp: session/update", "session_id", sid, "params", string(params))
@@ -734,9 +737,10 @@ func (s *acpSession) Send(prompt string, messageID string, images []core.ImageAt
 
 	// Text was streamed via session/update; engine aggregates EventText.
 	s.emit(core.Event{
-		Type:      core.EventResult,
-		SessionID: sid,
-		Done:      true,
+		Type:        core.EventResult,
+		SessionID:   sid,
+		Done:        true,
+		TotalTokens: parsePromptUsage(sid, res),
 	})
 	return nil
 }
@@ -891,4 +895,111 @@ func summarizeACPToolInput(kind string, raw json.RawMessage) string {
 	}
 	b, _ := json.MarshalIndent(m, "", "  ")
 	return string(b)
+}
+
+// acpUsageState holds the latest ACP usage_update (context window load).
+type acpUsageState struct {
+	mu    sync.Mutex
+	usage *core.ContextUsage
+}
+
+func (s *acpSession) usageState() *acpUsageState {
+	return &s.usage
+}
+
+// maybeAbsorbUsageUpdate records ACP `usage_update` notifications
+// ({"sessionUpdate":"usage_update","used":N,"size":M,"cost":{...}}).
+func (s *acpSession) maybeAbsorbUsageUpdate(params json.RawMessage) {
+	used, size, ok := parseUsageUpdate(params)
+	if !ok {
+		return
+	}
+	slog.Info("acp: usage_update", "session_id", s.currentACPSessionID(), "used", used, "size", size)
+	st := s.usageState()
+	st.mu.Lock()
+	st.usage = &core.ContextUsage{UsedTokens: used, ContextWindow: size}
+	st.mu.Unlock()
+}
+
+func parseUsageUpdate(params json.RawMessage) (used, size int, ok bool) {
+	var wrap struct {
+		Update struct {
+			SessionUpdate string   `json:"sessionUpdate"`
+			Used          *float64 `json:"used"`
+			Size          *float64 `json:"size"`
+		} `json:"update"`
+	}
+	if json.Unmarshal(params, &wrap) != nil || wrap.Update.SessionUpdate != "usage_update" || wrap.Update.Used == nil {
+		return 0, 0, false
+	}
+	used = int(*wrap.Update.Used)
+	if wrap.Update.Size != nil {
+		size = int(*wrap.Update.Size)
+	}
+	return used, size, true
+}
+
+// GetContextUsage implements core.ContextUsageReporter from the last
+// usage_update the agent sent (nil when none yet).
+func (s *acpSession) GetContextUsage() *core.ContextUsage {
+	st := s.usageState()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.usage == nil {
+		return nil
+	}
+	u := *st.usage
+	return &u
+}
+
+var _ core.ContextUsageReporter = (*acpSession)(nil)
+
+// parsePromptUsage logs the (unstable) PromptResponse.usage token counts and
+// returns totalTokens (or input+output when total is missing).
+func parsePromptUsage(sid string, res json.RawMessage) int {
+	var r struct {
+		StopReason string `json:"stopReason"`
+		Usage      *struct {
+			TotalTokens       *float64 `json:"totalTokens"`
+			InputTokens       *float64 `json:"inputTokens"`
+			OutputTokens      *float64 `json:"outputTokens"`
+			ThoughtTokens     *float64 `json:"thoughtTokens"`
+			CachedReadTokens  *float64 `json:"cachedReadTokens"`
+			CachedWriteTokens *float64 `json:"cachedWriteTokens"`
+		} `json:"usage"`
+		Meta map[string]any `json:"_meta"`
+	}
+	if len(res) == 0 || json.Unmarshal(res, &r) != nil {
+		return 0
+	}
+	n := func(p *float64) int {
+		if p == nil {
+			return -1
+		}
+		return int(*p)
+	}
+	metaKeys := make([]string, 0, len(r.Meta))
+	for k := range r.Meta {
+		metaKeys = append(metaKeys, k)
+	}
+	if r.Usage == nil {
+		slog.Info("acp: prompt usage", "session_id", sid, "stop_reason", r.StopReason, "usage", "absent", "meta_keys", metaKeys)
+		return 0
+	}
+	u := r.Usage
+	slog.Info("acp: prompt usage", "session_id", sid, "stop_reason", r.StopReason,
+		"total", n(u.TotalTokens), "input", n(u.InputTokens), "output", n(u.OutputTokens),
+		"thought", n(u.ThoughtTokens), "cached_read", n(u.CachedReadTokens), "cached_write", n(u.CachedWriteTokens),
+		"meta_keys", metaKeys)
+	if t := n(u.TotalTokens); t > 0 {
+		return t
+	}
+	t := 0
+	if v := n(u.InputTokens); v > 0 {
+		t += v
+	}
+	if v := n(u.OutputTokens); v > 0 {
+		t += v
+	}
+	return t
 }
