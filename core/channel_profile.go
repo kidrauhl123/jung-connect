@@ -25,6 +25,9 @@ type ChannelProfile struct {
 	Model           string
 	ReasoningEffort string
 	WorkDir         string
+	// StatusMessage overrides the platform / project status_message toggle
+	// for this channel (nil = inherit).
+	StatusMessage *bool
 }
 
 // ResolvedSkill is a skill reference resolved to a directory containing SKILL.md.

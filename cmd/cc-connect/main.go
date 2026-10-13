@@ -575,6 +575,7 @@ func main() {
 				HideAgentFooter:  hideAgentFooter,
 			})
 		}
+		applyStatusMessageConfig(engine, cfg, &proj)
 
 		// Wire shell configuration
 		shell, shellFlag, shellProfile := config.EffectiveShell(cfg, &proj)
@@ -1776,6 +1777,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 		HideAgentFooter:  hideAgentFooter,
 	})
 	result.DisplayUpdated = true
+	applyStatusMessageConfig(engine, cfg, proj)
 
 	// Wire show_context_indicator and reply_footer from display config
 	engine.SetShowContextIndicator(showCtx)
@@ -2114,6 +2116,16 @@ func applyChannelProfiles(engine *core.Engine, proj *config.ProjectConfig, confi
 	return nil
 }
 
+func applyStatusMessageConfig(engine *core.Engine, cfg *config.Config, proj *config.ProjectConfig) {
+	enabled, intervalSecs, stuckMins, onDone := config.EffectiveStatusMessage(cfg, proj)
+	engine.SetStatusMessageConfig(core.StatusMessageCfg{
+		Enabled:    enabled,
+		Interval:   time.Duration(intervalSecs) * time.Second,
+		StuckAfter: time.Duration(stuckMins) * time.Minute,
+		OnDone:     onDone,
+	})
+}
+
 func channelProfilesFromConfig(chans []config.ChannelConfig, baseDir string) ([]core.ChannelProfile, error) {
 	raw := make([]core.ChannelProfile, 0, len(chans))
 	for _, ch := range chans {
@@ -2125,6 +2137,7 @@ func channelProfilesFromConfig(chans []config.ChannelConfig, baseDir string) ([]
 			Model:           ch.Model,
 			ReasoningEffort: ch.ReasoningEffort,
 			WorkDir:         ch.WorkDir,
+			StatusMessage:   ch.StatusMessage,
 		})
 	}
 	return core.NormalizeChannelProfiles(raw, baseDir)
