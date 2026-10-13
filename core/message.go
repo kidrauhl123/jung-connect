@@ -493,6 +493,7 @@ type Event struct {
 	OutputTokens             int
 	CacheCreationInputTokens int            // cache-write tokens (new content written to cache)
 	CacheReadInputTokens     int            // cache-read tokens (prior context retrieved from cache)
+	TotalTokens              int            // optional turn token total reported by the agent (e.g. ACP PromptResponse.usage)
 	Metadata                 map[string]any // optional metadata from agent (e.g. compaction_continue)
 	Synthetic                bool           // true if this is a synthetic/generated message (not from real user)
 }
