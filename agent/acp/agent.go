@@ -490,7 +490,7 @@ func (a *Agent) fetchModelsFromAPI(ctx context.Context) []core.ModelOption {
 	seen := make(map[string]struct{})
 	for _, m := range result.Data {
 		id := strings.TrimSpace(m.ID)
-		if !isGrokChatModel(id) {
+		if !isChatModel(id) {
 			continue
 		}
 		if _, ok := seen[id]; ok {
@@ -537,7 +537,7 @@ func parseGrokModelsCLI(out string) []core.ModelOption {
 			continue
 		}
 		name := id[0]
-		if !isGrokChatModel(name) {
+		if !isChatModel(name) {
 			continue
 		}
 		if _, ok := seen[name]; ok {
@@ -550,19 +550,29 @@ func parseGrokModelsCLI(out string) []core.ModelOption {
 	return models
 }
 
-func isGrokChatModel(id string) bool {
+// nonChatModelMarkers lists substrings that identify non-chat models
+// (image/video generation, speech, embeddings, moderation, ...).
+var nonChatModelMarkers = []string{
+	"image", "imagine", "video", "veo", "sora", "dall-e", "dalle", "midjourney", "flux",
+	"stable-diffusion", "sdxl", "kling", "seedance", "seedream", "wan2", "hailuo",
+	"tts", "stt", "whisper", "speech", "transcribe", "voice", "audio", "realtime", "music", "suno",
+	"embedding", "embed", "rerank", "moderation", "omni-moderation",
+}
+
+// isChatModel reports whether a model id looks like a chat/text model.
+// Any vendor is accepted (the gateway token is the permission boundary);
+// only obviously non-chat models are excluded.
+func isChatModel(id string) bool {
 	id = strings.ToLower(strings.TrimSpace(id))
 	if id == "" {
 		return false
 	}
-	switch {
-	case strings.HasPrefix(id, "grok-4"),
-		strings.HasPrefix(id, "grok-composer"),
-		strings.HasPrefix(id, "grok-build"),
-		strings.HasPrefix(id, "grok-chat"):
-		return true
+	for _, m := range nonChatModelMarkers {
+		if strings.Contains(id, m) {
+			return false
+		}
 	}
-	return false
+	return true
 }
 
 func acpFallbackModels() []core.ModelOption {
