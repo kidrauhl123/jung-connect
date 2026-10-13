@@ -706,3 +706,21 @@ const (
 type PreviewStatusUpdater interface {
 	SetPreviewStatus(previewHandle any, status CardStatus)
 }
+
+// ProgressReplyContexter is implemented by platforms whose replies can carry
+// a reply reference (e.g. Discord reply_to_mode). ProgressReplyContext
+// returns a reply context for intermediate output (process text segments,
+// tool / thinking messages, status) that must never carry a reply
+// reference; only the final answer uses the original context.
+type ProgressReplyContexter interface {
+	ProgressReplyContext(replyCtx any) any
+}
+
+// ProgressReplyCtx returns p's progress reply context, or replyCtx
+// unchanged when the platform does not distinguish progress messages.
+func ProgressReplyCtx(p Platform, replyCtx any) any {
+	if pr, ok := p.(ProgressReplyContexter); ok && replyCtx != nil {
+		return pr.ProgressReplyContext(replyCtx)
+	}
+	return replyCtx
+}
