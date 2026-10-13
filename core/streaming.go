@@ -539,6 +539,13 @@ func (sp *streamPreview) setStatus(status CardStatus) {
 // detachPreview clears the preview message handle so that finish() won't
 // delete it. Call this after freeze() when the frozen preview should remain
 // visible as a permanent message (e.g. text before the first tool call).
+// hasPreview reports whether a live (non-degraded) preview message exists.
+func (sp *streamPreview) hasPreview() bool {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	return sp.previewMsgID != nil && !sp.degraded
+}
+
 func (sp *streamPreview) detachPreview() {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()

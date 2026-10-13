@@ -370,6 +370,11 @@ func normalizeProgressAgentLabel(name string) string {
 // Append appends one progress item and updates the in-place message.
 // Returns true when compact rendering handled this item; false means caller
 // should fallback to legacy per-event send.
+// Enabled reports whether progress is rendered as a compact/card message.
+func (w *compactProgressWriter) Enabled() bool {
+	return w != nil && w.enabled
+}
+
 func (w *compactProgressWriter) Append(item string) bool {
 	return w.AppendEvent(ProgressEntryInfo, item, "", item)
 }

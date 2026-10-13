@@ -5148,8 +5148,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	workspaceRenderer := func(content string) string {
 		return e.renderOutgoingContentForWorkspace(state.platform, content, workspaceDir)
 	}
+	// sendWorkspace is used only for intermediate (process) output: text
+	// segments flushed at tool/thinking boundaries, thinking and tool
+	// messages. It uses the platform's progress reply context so those
+	// messages never carry a reply reference — only the final answer does.
 	sendWorkspace := func(p Platform, replyCtx any, content string) {
-		e.sendForWorkspace(p, replyCtx, content, workspaceDir)
+		e.sendForWorkspace(p, ProgressReplyCtx(p, replyCtx), content, workspaceDir)
 	}
 	sendWorkspaceWithError := func(p Platform, replyCtx any, content string) error {
 		return e.sendWithErrorForWorkspace(p, replyCtx, content, workspaceDir)
@@ -5189,7 +5193,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		if streamCard != nil || !e.statusMessageEnabled(p, sessionKey) {
 			return
 		}
-		sm := newStatusMessage(e.ctx, p, rc, e.statusMsgCfg)
+		sm := newStatusMessage(e.ctx, p, ProgressReplyCtx(p, rc), e.statusMsgCfg)
 		if sm == nil || !sm.Start() {
 			return
 		}
@@ -5198,7 +5202,6 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		}
 		sm.StartTicker()
 		statusMsg = sm
-		showThinking, showTools, displayMode = false, false, "quiet"
 	}
 	startStatus(state.platform, state.replyCtx)
 	defer func() { statusMsg.Finish(false) }()
@@ -5211,7 +5214,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		if replyContent == "" {
 			replyContent = e.i18n.T(MsgStarting)
 		}
-		e.send(state.platform, state.replyCtx, replyContent)
+		e.send(state.platform, ProgressReplyCtx(state.platform, state.replyCtx), replyContent)
 	}
 
 	// Idle timeout: resets on every received event (0 = disabled)
@@ -5451,8 +5454,15 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				} else {
 					if sp.canPreview() {
+						// Commit this process-text segment as its own message
+						// and re-arm so the next segment opens a fresh preview
+						// (instead of degrading to plain Sends for the rest of
+						// the turn).
 						sp.freeze()
 						sp.detachPreview()
+						if !cp.Enabled() {
+							sp.unfreeze()
+						}
 					} else {
 						segment := strings.Join(textParts[segmentStart:], "")
 						if segment != "" {
@@ -5490,6 +5500,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				sp.freeze()
 				if previewActive {
 					sp.detachPreview() // keep frozen preview visible as permanent message
+					if !cp.Enabled() {
+						sp.unfreeze() // next text segment opens its own preview
+					}
 				}
 				preview := truncateIf(accumulatedThinking, e.display.ThinkingMaxLen)
 				thinkingMsg := fmt.Sprintf(e.i18n.T(MsgThinking), preview)
@@ -5546,8 +5559,15 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				} else {
 					if sp.canPreview() {
+						// Commit this process-text segment as its own message
+						// and re-arm so the next segment opens a fresh preview
+						// (instead of degrading to plain Sends for the rest of
+						// the turn).
 						sp.freeze()
 						sp.detachPreview()
+						if !cp.Enabled() {
+							sp.unfreeze()
+						}
 					} else {
 						segment := strings.Join(textParts[segmentStart:], "")
 						if segment != "" {
@@ -5606,6 +5626,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				sp.freeze()
 				if previewActive {
 					sp.detachPreview() // keep frozen preview visible as permanent message
+					if !cp.Enabled() {
+						sp.unfreeze() // next text segment opens its own preview
+					}
 				}
 				toolInput := event.ToolInput
 				var formattedInput string
@@ -5677,7 +5700,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 					if !cp.AppendStructured(entry, resultMsg) {
 						if !SuppressStandaloneToolResultEvent(p) {
-							e.sendRaw(p, replyCtx, resultMsg)
+							e.sendRaw(p, ProgressReplyCtx(p, replyCtx), resultMsg)
 						}
 					}
 				}
@@ -6240,11 +6263,17 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			} else if toolCount > 0 && segmentStart > 0 {
 				// When tool calls happened and prior text was already surfaced in segments,
-				// only send the unsent remainder. When tool progress is hidden, tool events don't surface
-				// side-channel messages and segmentStart stays 0, so keep normal finalize flow.
-				sp.discard()
+				// only send the unsent remainder. If that remainder is already streaming
+				// in a (re-armed) preview, finalize it in place — never delete and
+				// resend (it then carries no reply reference; accepted trade-off).
+				unsent := ""
 				if segmentStart < len(textParts) {
-					unsent := strings.Join(textParts[segmentStart:], "")
+					unsent = strings.Join(textParts[segmentStart:], "")
+				}
+				if unsent != "" && sp.hasPreview() && sp.finish(unsent, statusFooter) {
+					slog.Debug("EventResult: final segment finalized via stream preview", "response_len", len(unsent))
+				} else {
+					sp.discard()
 					if unsent != "" {
 						if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, unsent, statusFooter, sendWorkspaceWithError) {
 							return

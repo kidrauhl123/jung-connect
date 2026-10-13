@@ -43,6 +43,10 @@ type replyContext struct {
 	// created the thread. Semantic rename only proceeds while Discord
 	// still shows this name (a human rename is left alone).
 	autoThreadInitialName string
+	// progress marks intermediate output (process text, tool / thinking
+	// messages, status). Such messages never carry a reply reference;
+	// reply_to_mode applies only to the final answer.
+	progress bool
 }
 
 // interactionReplyCtx handles Discord slash command (Application Command)
@@ -595,6 +599,9 @@ func (rc replyContext) messageReference() *discordgo.MessageReference {
 }
 
 func (rc replyContext) referenceForChunk(mode string, index int) *discordgo.MessageReference {
+	if rc.progress {
+		return nil
+	}
 	switch mode {
 	case "all":
 		return rc.messageReference()
@@ -1401,6 +1408,18 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 		return fmt.Errorf("discord: invalid reply context type %T", rctx)
 	}
 }
+
+// ProgressReplyContext implements core.ProgressReplyContexter: progress
+// messages are sent without a reply reference.
+func (p *Platform) ProgressReplyContext(rctx any) any {
+	if rc, ok := rctx.(replyContext); ok {
+		rc.progress = true
+		return rc
+	}
+	return rctx
+}
+
+var _ core.ProgressReplyContexter = (*Platform)(nil)
 
 // Send delivers a channel message. Hermes reply_to_mode applies here:
 // the engine's final answer uses Send, not Reply. Progress uses

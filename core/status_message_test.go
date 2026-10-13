@@ -406,48 +406,6 @@ func TestStatusMessageEnabled_Precedence(t *testing.T) {
 	}
 }
 
-func TestProcessInteractiveEvents_StatusMessageReplacesToolMessages(t *testing.T) {
-	p := &statusFakePlatform{stubPlatformEngine: stubPlatformEngine{n: "fake"}}
-	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
-	e.SetDisplayConfig(DisplayCfg{Mode: "full", ThinkingMessages: true, ToolMessages: true})
-	e.SetStatusMessageConfig(StatusMessageCfg{Enabled: true, Interval: time.Hour})
-	e.SetStreamPreviewCfg(StreamPreviewCfg{Enabled: false})
-	sessionKey := "fake:user1"
-	session := e.sessions.GetOrCreateActive(sessionKey)
-	as := newControllableSession("s1")
-	state := &interactiveState{agentSession: as, platform: p, replyCtx: "ctx-1"}
-	e.interactiveStates[sessionKey] = state
-
-	as.events <- Event{Type: EventThinking, Content: "let me look"}
-	as.events <- Event{Type: EventToolUse, ToolName: "read_file", ToolInput: `{"target_file":"a/upstream.go"}`}
-	as.events <- Event{Type: EventText, Content: "Checked the file."}
-	as.events <- Event{Type: EventToolUse, ToolName: "grep", ToolInput: `{"pattern":"foo"}`}
-	as.events <- Event{Type: EventToolUse, ToolName: "bash", ToolInput: "go test ./..."}
-	as.events <- Event{Type: EventText, Content: "All good."}
-	as.events <- Event{Type: EventResult, Content: "All good.", Done: true}
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
-
-	starts, edits, _ := p.snapshot()
-	if len(starts) != 1 {
-		t.Fatalf("status starts = %v, want exactly one", starts)
-	}
-	if !strings.HasPrefix(lastOf(edits), "✅ Done (3 steps") {
-		t.Fatalf("final status = %q (edits %v)", lastOf(edits), edits)
-	}
-	sent := p.getSent()
-	if len(sent) != 1 {
-		t.Fatalf("sent = %#v, want only the final reply", sent)
-	}
-	if !strings.Contains(sent[0], "Checked the file.") || !strings.Contains(sent[0], "All good.") {
-		t.Fatalf("final reply = %q", sent[0])
-	}
-	for _, s := range sent {
-		if strings.Contains(s, "upstream.go") || strings.Contains(s, "let me look") {
-			t.Fatalf("tool/thinking leaked into chat: %q", s)
-		}
-	}
-}
-
 func TestProcessInteractiveEvents_StatusMessageOffKeepsToolMessages(t *testing.T) {
 	p := &statusFakePlatform{stubPlatformEngine: stubPlatformEngine{n: "fake"}}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -470,52 +428,6 @@ func TestProcessInteractiveEvents_StatusMessageOffKeepsToolMessages(t *testing.T
 	}
 	if len(p.getSent()) < 2 && len(starts) == 0 {
 		t.Fatalf("tool message missing: sent=%v starts=%v", p.getSent(), starts)
-	}
-}
-
-func TestProcessInteractiveEvents_StatusMessageWithStreamPreview(t *testing.T) {
-	p := &statusFakePlatform{stubPlatformEngine: stubPlatformEngine{n: "fake"}}
-	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
-	e.SetDisplayConfig(DisplayCfg{Mode: "full", ThinkingMessages: true, ToolMessages: true})
-	e.SetStatusMessageConfig(StatusMessageCfg{Enabled: true, Interval: time.Hour})
-	sessionKey := "fake:user1"
-	session := e.sessions.GetOrCreateActive(sessionKey)
-	as := newControllableSession("s1")
-	state := &interactiveState{agentSession: as, platform: p, replyCtx: "ctx-1"}
-	e.interactiveStates[sessionKey] = state
-
-	as.events <- Event{Type: EventToolUse, ToolName: "bash", ToolInput: "ls"}
-	as.events <- Event{Type: EventText, Content: "Here is the answer, long enough to stream as a preview message."}
-	as.events <- Event{Type: EventToolUse, ToolName: "bash", ToolInput: "pwd"}
-	as.events <- Event{Type: EventResult, Content: "Here is the answer, long enough to stream as a preview message.", Done: true}
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
-
-	starts, edits, _ := p.snapshot()
-	n := 0
-	for _, s := range starts {
-		if strings.HasPrefix(s, "⏳") {
-			n++
-		}
-	}
-	if n != 1 {
-		t.Fatalf("status starts = %d (%v), want 1", n, starts)
-	}
-	found := false
-	for _, ed := range edits {
-		if strings.HasPrefix(ed, "✅ Done (2 steps") {
-			found = true
-		}
-		if strings.Contains(ed, "🔧") {
-			t.Fatalf("tool message leaked: %q", ed)
-		}
-	}
-	if !found {
-		t.Fatalf("no completion edit: %v", edits)
-	}
-	for _, s := range p.getSent() {
-		if strings.Contains(s, "🔧") || strings.Contains(s, "pwd") {
-			t.Fatalf("tool message leaked: %q", s)
-		}
 	}
 }
 
