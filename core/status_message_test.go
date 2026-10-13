@@ -397,3 +397,66 @@ func TestProcessInteractiveEvents_StatusMessageWithStreamPreview(t *testing.T) {
 		}
 	}
 }
+
+func runGapTurn(t *testing.T, status bool, preview bool) (*statusFakePlatform, []string) {
+	t.Helper()
+	p := &statusFakePlatform{stubPlatformEngine: stubPlatformEngine{n: "fake"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{Mode: "quiet"})
+	e.SetStatusMessageConfig(StatusMessageCfg{Enabled: status, Interval: time.Hour})
+	if !preview {
+		e.SetStreamPreviewCfg(StreamPreviewCfg{Enabled: false})
+	}
+	sessionKey := "fake:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	as := newControllableSession("s1")
+	state := &interactiveState{agentSession: as, platform: p, replyCtx: "ctx-1"}
+	e.interactiveStates[sessionKey] = state
+	go func() {
+		as.events <- Event{Type: EventText, Content: "First sentence of narration here."}
+		for i := 0; i < 6; i++ {
+			as.events <- Event{Type: EventThinking, Content: "hmm"}
+			as.events <- Event{Type: EventToolUse, ToolName: "bash", ToolInput: "ls"}
+		}
+		as.events <- Event{Type: EventText, Content: "Second sentence of narration here."}
+		as.events <- Event{Type: EventToolUse, ToolName: "bash", ToolInput: "pwd"}
+		as.events <- Event{Type: EventResult, Content: "", Done: true}
+	}()
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
+	starts, edits, _ := p.snapshot()
+	all := append(append(append([]string{}, starts...), edits...), p.getSent()...)
+	return p, all
+}
+
+func TestQuietTurn_NoStackedBlankLines(t *testing.T) {
+	for _, tc := range []struct{ status, preview bool }{{true, true}, {true, false}, {false, true}, {false, false}} {
+		_, all := runGapTurn(t, tc.status, tc.preview)
+		seen := false
+		for _, m := range all {
+			if strings.Contains(m, "\n\n\n") {
+				t.Fatalf("status=%v preview=%v: stacked blank lines in %q", tc.status, tc.preview, m)
+			}
+			if strings.Contains(m, "First sentence of narration here.\n\nSecond sentence") {
+				seen = true
+			}
+		}
+		if !seen && (tc.status || tc.preview) {
+			t.Fatalf("status=%v preview=%v: narration not joined by one blank line: %q", tc.status, tc.preview, all)
+		}
+	}
+}
+
+func TestStreamPreviewAppendSeparatorIdempotent(t *testing.T) {
+	sp := &streamPreview{cfg: StreamPreviewCfg{Enabled: true}, fullText: "abc"}
+	if !sp.appendSeparator("\n\n") {
+		t.Fatal("first separator should append")
+	}
+	for i := 0; i < 5; i++ {
+		if sp.appendSeparator("\n\n") {
+			t.Fatal("repeated separator should be skipped")
+		}
+	}
+	if sp.fullText != "abc\n\n" {
+		t.Fatalf("fullText = %q", sp.fullText)
+	}
+}

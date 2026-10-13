@@ -555,6 +555,12 @@ func (sp *streamPreview) appendSeparator(sep string) bool {
 	if sp.degraded || !sp.cfg.Enabled || sp.fullText == "" {
 		return false
 	}
+	// Consecutive hidden tool/thinking events must not stack separators:
+	// a turn with many tool calls between two narration sentences would
+	// otherwise render as a wall of blank lines.
+	if strings.HasSuffix(strings.TrimRight(sp.fullText, " \t"), "\n\n") {
+		return false
+	}
 	sp.fullText += sep
 	return true
 }
