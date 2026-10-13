@@ -5438,7 +5438,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if !showThinking && len(textParts) > segmentStart {
 				if displayMode == "quiet" {
 					if sp.canPreview() {
-						if sp.appendSeparator("\n\n") {
+						if sp.appendSeparator("\n\n") && !strings.HasSuffix(textParts[len(textParts)-1], "\n\n") {
 							textParts = append(textParts, "\n\n")
 						}
 					} else if statusMsg.Active() && !strings.HasSuffix(textParts[len(textParts)-1], "\n\n") {
@@ -5533,7 +5533,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if !showTools && len(textParts) > segmentStart {
 				if displayMode == "quiet" {
 					if sp.canPreview() {
-						if sp.appendSeparator("\n\n") {
+						if sp.appendSeparator("\n\n") && !strings.HasSuffix(textParts[len(textParts)-1], "\n\n") {
 							textParts = append(textParts, "\n\n")
 						}
 					} else if statusMsg.Active() && !strings.HasSuffix(textParts[len(textParts)-1], "\n\n") {
