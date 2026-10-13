@@ -2,6 +2,8 @@ package acp
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
 
@@ -56,7 +58,7 @@ func TestInjectReasoningEffortArgs_rejectsUnknown(t *testing.T) {
 	}
 }
 
-func TestIsGrokChatModel(t *testing.T) {
+func TestIsChatModel(t *testing.T) {
 	cases := map[string]bool{
 		"grok-4.6":               true,
 		"grok-composer-2.5-fast": true,
@@ -65,11 +67,22 @@ func TestIsGrokChatModel(t *testing.T) {
 		"grok-imagine-image":     false,
 		"grok-voice-latest":      false,
 		"grok-stt":               false,
+		"claude-sonnet-4-6":      true,
+		"gemini-3.8-flash-high":  true,
+		"deepseek-v4-pro":        true,
+		"glm-5.3-flash":          true,
+		"mimo-v2.6-pro":          true,
+		"gpt-5.5":                true,
+		"gemini-2.5-flash-image": false,
+		"veo-3":                  false,
+		"tts-1":                  false,
+		"whisper-1":              false,
+		"text-embedding-3-small": false,
 		"":                       false,
 	}
 	for id, want := range cases {
-		if got := isGrokChatModel(id); got != want {
-			t.Errorf("isGrokChatModel(%q)=%v, want %v", id, got, want)
+		if got := isChatModel(id); got != want {
+			t.Errorf("isChatModel(%q)=%v, want %v", id, got, want)
 		}
 	}
 }
@@ -131,4 +144,24 @@ func TestAgent_ModelSwitcher(t *testing.T) {
 	}
 	_ = acpFallbackModels()
 	_ = a.(*Agent).AvailableModels(context.Background())
+}
+
+func TestFetchModelsFromAPI_MultiVendor(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[{"id":"grok-4.7-high"},{"id":"claude-sonnet-4-6"},{"id":"gemini-3.1-pro"},{"id":"deepseek-v4-flash"},{"id":"glm-5.3-flash"},{"id":"mimo-v2.6-pro"},{"id":"grok-imagine-image"},{"id":"veo-3"},{"id":"text-embedding-3-small"},{"id":"claude-sonnet-4-6"}]}`))
+	}))
+	defer srv.Close()
+	ag, err := New(map[string]any{"command": "true", "env": map[string]any{"XAI_API_KEY": "k", "GROK_MODELS_BASE_URL": srv.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := ag.(*Agent).fetchModelsFromAPI(context.Background())
+	var names []string
+	for _, m := range got {
+		names = append(names, m.Name)
+	}
+	want := []string{"claude-sonnet-4-6", "deepseek-v4-flash", "gemini-3.1-pro", "glm-5.3-flash", "grok-4.7-high", "mimo-v2.6-pro"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("got %v, want %v", names, want)
+	}
 }

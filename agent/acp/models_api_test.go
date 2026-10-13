@@ -35,7 +35,7 @@ func TestAvailableModels_FromAPI(t *testing.T) {
 	names := make([]string, len(models))
 	for i, m := range models {
 		names[i] = m.Name
-		if !isGrokChatModel(m.Name) {
+		if !isChatModel(m.Name) {
 			t.Fatalf("unfiltered model leaked: %s", m.Name)
 		}
 	}
