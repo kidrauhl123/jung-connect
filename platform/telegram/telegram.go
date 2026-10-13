@@ -145,8 +145,10 @@ func (t *stdlibTypingTicker) C() <-chan time.Time { return t.Ticker.C }
 type botFactory func(token string, onUpdate func(context.Context, *models.Update), httpClient *http.Client) (telegramBot, *models.User, func(context.Context), error)
 
 type Platform struct {
-	platformName         string
-	apiBase              string
+	statusMessage         bool
+	statusMessageSet      bool
+	platformName          string
+	apiBase               string
 	token                 string
 	allowFrom             string
 	groupReplyAll         bool
@@ -263,9 +265,12 @@ func newPlatform(opts map[string]any, platformName, defaultAPIBase string) (core
 		}
 	}
 
+	statusMessage, statusMessageSet := opts["status_message"].(bool)
 	return &Platform{
-		platformName:         platformName,
-		apiBase:              apiBase,
+		platformName:     platformName,
+		statusMessage:    statusMessage,
+		statusMessageSet: statusMessageSet,
+		apiBase:          apiBase,
 		newBot: func(token string, onUpdate func(context.Context, *models.Update), httpClient *http.Client) (telegramBot, *models.User, func(context.Context), error) {
 			return newBotWithServerURL(token, apiBase, onUpdate, httpClient)
 		},
@@ -2028,3 +2033,11 @@ var _ core.AudioSender = (*Platform)(nil)
 var _ core.ProgressStyleProvider = (*Platform)(nil)
 var _ core.ProgressUpdateThrottler = (*Platform)(nil)
 var _ core.ChannelNameResolver = (*Platform)(nil)
+
+// StatusMessagePreference reports the platform-level status_message option
+// (core.StatusMessagePreference).
+func (p *Platform) StatusMessagePreference() (bool, bool) {
+	return p.statusMessage, p.statusMessageSet
+}
+
+var _ core.StatusMessagePreference = (*Platform)(nil)

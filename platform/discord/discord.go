@@ -60,6 +60,8 @@ type progressPlatform struct {
 }
 
 type Platform struct {
+	statusMessage              bool
+	statusMessageSet           bool
 	token                      string
 	allowFrom                  string
 	guildID                    string // optional: per-guild registration (instant) vs global (up to 1h propagation)
@@ -159,7 +161,10 @@ func New(opts map[string]any) (core.Platform, error) {
 		proxyU = u
 	}
 
+	statusMessage, statusMessageSet := opts["status_message"].(bool)
 	base := &Platform{
+		statusMessage:              statusMessage,
+		statusMessageSet:           statusMessageSet,
 		token:                      token,
 		allowFrom:                  allowFrom,
 		guildID:                    guildID,
@@ -2176,3 +2181,11 @@ func applyReferencedMessage(ref *discordgo.Message, content string, images []cor
 	}
 	return content, images
 }
+
+// StatusMessagePreference reports the platform-level status_message option
+// (core.StatusMessagePreference).
+func (p *Platform) StatusMessagePreference() (bool, bool) {
+	return p.statusMessage, p.statusMessageSet
+}
+
+var _ core.StatusMessagePreference = (*Platform)(nil)

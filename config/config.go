@@ -202,6 +202,13 @@ type DisplayConfig struct {
 	ShowContextIndicator *bool   `toml:"show_context_indicator"` // whether [ctx: ~N%] suffix is shown; default true
 	ReplyFooter          *bool   `toml:"reply_footer"`           // whether Codex-like footer is shown; default true
 	HideAgentFooter      *bool   `toml:"hide_agent_footer"`      // strip agent-emitted model/token footer lines; default false
+	// Status message: one editable "working…" message per turn instead of
+	// per-event thinking/tool messages. Overridable per platform
+	// (options.status_message) and per channel ([[projects.channels]]).
+	StatusMessage      *bool   `toml:"status_message"`       // default false
+	StatusIntervalSecs *int    `toml:"status_interval_secs"` // min seconds between edits; default 3
+	StatusStuckMins    *int    `toml:"status_stuck_mins"`    // minutes without progress before "可能卡住"; default 3
+	StatusOnDone       *string `toml:"status_on_done"`       // "summary" (default) or "delete"
 }
 
 // StreamPreviewConfig controls real-time streaming preview in IM.
@@ -488,6 +495,9 @@ type ChannelConfig struct {
 	// WorkDir pins the channel's workspace (multi-workspace mode only); it
 	// takes precedence over /workspace bindings.
 	WorkDir string `toml:"work_dir,omitempty"`
+	// StatusMessage overrides the platform / project status_message toggle
+	// for sessions in this channel.
+	StatusMessage *bool `toml:"status_message,omitempty"`
 }
 
 type ProjectConfig struct {
@@ -1131,7 +1141,56 @@ func validateDisplayConfig(prefix string, display *DisplayConfig) error {
 	if display.HistoryMaxLen != nil && *display.HistoryMaxLen < 0 {
 		return fmt.Errorf("config: %s.history_max_len must be >= 0", prefix)
 	}
+	if display.StatusOnDone != nil {
+		switch strings.ToLower(strings.TrimSpace(*display.StatusOnDone)) {
+		case "", "summary", "delete":
+		default:
+			return fmt.Errorf("config: %s.status_on_done must be \"summary\" or \"delete\"", prefix)
+		}
+	}
+	if display.StatusIntervalSecs != nil && *display.StatusIntervalSecs < 1 {
+		return fmt.Errorf("config: %s.status_interval_secs must be >= 1", prefix)
+	}
+	if display.StatusStuckMins != nil && *display.StatusStuckMins < 1 {
+		return fmt.Errorf("config: %s.status_stuck_mins must be >= 1", prefix)
+	}
 	return nil
+}
+
+// EffectiveStatusMessage resolves the status-message settings:
+// [projects.display] over [display] over defaults (off, 3s, 3min, summary).
+func EffectiveStatusMessage(cfg *Config, proj *ProjectConfig) (enabled bool, intervalSecs, stuckMins int, onDone string) {
+	var pd *DisplayConfig
+	if proj != nil {
+		pd = proj.Display
+	}
+	gd := &cfg.Display
+	enabled = false
+	intervalSecs, stuckMins, onDone = 3, 3, "summary"
+	if pd != nil && pd.StatusMessage != nil {
+		enabled = *pd.StatusMessage
+	} else if gd.StatusMessage != nil {
+		enabled = *gd.StatusMessage
+	}
+	if pd != nil && pd.StatusIntervalSecs != nil {
+		intervalSecs = *pd.StatusIntervalSecs
+	} else if gd.StatusIntervalSecs != nil {
+		intervalSecs = *gd.StatusIntervalSecs
+	}
+	if pd != nil && pd.StatusStuckMins != nil {
+		stuckMins = *pd.StatusStuckMins
+	} else if gd.StatusStuckMins != nil {
+		stuckMins = *gd.StatusStuckMins
+	}
+	if pd != nil && pd.StatusOnDone != nil {
+		onDone = strings.ToLower(strings.TrimSpace(*pd.StatusOnDone))
+	} else if gd.StatusOnDone != nil {
+		onDone = strings.ToLower(strings.TrimSpace(*gd.StatusOnDone))
+	}
+	if onDone != "delete" {
+		onDone = "summary"
+	}
+	return
 }
 
 var supportedReferenceAgents = map[string]struct{}{

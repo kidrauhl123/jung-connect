@@ -365,6 +365,7 @@ type Engine struct {
 	speech                SpeechCfg
 	tts                   *TTSCfg
 	display               DisplayCfg
+	statusMsgCfg          StatusMessageCfg
 	injectSender          bool
 	attachmentSendEnabled bool
 	startedAt             time.Time
@@ -5173,10 +5174,36 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	cp := newCompactProgressWriter(e.ctx, state.platform, state.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), workspaceRenderer)
 	state.mu.Unlock()
 
+	// Status message ([display] status_message / platform / channel toggle):
+	// one editable "working…" message per turn replaces per-event thinking /
+	// tool messages; the turn then behaves like display mode "quiet" so the
+	// final reply arrives as one separate message.
+	showThinking := e.display.ThinkingMessages
+	showTools := e.display.ToolMessages
+	displayMode := e.display.Mode
+	var statusMsg *statusMessage
+	startStatus := func(p Platform, rc any) {
+		statusMsg.Finish(true)
+		statusMsg = nil
+		showThinking, showTools, displayMode = e.display.ThinkingMessages, e.display.ToolMessages, e.display.Mode
+		if streamCard != nil || !e.statusMessageEnabled(p, sessionKey) {
+			return
+		}
+		sm := newStatusMessage(e.ctx, p, rc, e.statusMsgCfg)
+		if sm == nil || !sm.Start() {
+			return
+		}
+		sm.StartTicker()
+		statusMsg = sm
+		showThinking, showTools, displayMode = false, false, "quiet"
+	}
+	startStatus(state.platform, state.replyCtx)
+	defer func() { statusMsg.Finish(false) }()
+
 	// Send instant confirmation reply if enabled and no streaming card is active.
 	// Streaming cards provide their own "processing" indicator, so instant reply
 	// is only needed when the platform doesn't support cards or card creation failed.
-	if e.instantReply.Enabled && streamCard == nil {
+	if e.instantReply.Enabled && streamCard == nil && !statusMsg.Active() {
 		replyContent := e.instantReply.Content
 		if replyContent == "" {
 			replyContent = e.i18n.T(MsgStarting)
@@ -5339,7 +5366,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		state.mu.Unlock()
 
 		// main codebase has no per-session quiet flag; pr309 referenced
-		// sessionQuiet which we drop. e.display.ThinkingMessages /
+		// sessionQuiet which we drop. showThinking /
 		// ToolMessages handle user-level quiet in the fallback branches.
 		richCardSupporter, hasRichCard := p.(RichCardSupporter)
 		// Card 2.0 rich-card path is opt-in via [display] mode = "rich".
@@ -5367,11 +5394,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if isEllipsisOnly(event.Content) {
 				break
 			}
+			statusMsg.Thinking()
 			thinkingAcc.WriteString(event.Content)
 			accumulatedThinking := thinkingAcc.String()
 			if hasRichCard {
 				// When thinking messages are suppressed, skip card creation.
-				if !e.display.ThinkingMessages {
+				if !showThinking {
 					break
 				}
 				if thinking := strings.TrimSpace(truncateIf(accumulatedThinking, e.display.ThinkingMaxLen)); thinking != "" {
@@ -5407,9 +5435,15 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// When thinking messages are hidden, behavior depends on display mode:
 			//   quiet:   append separator to keep all text in one card
 			//   compact: freeze+detach to split text into separate cards
-			if !e.display.ThinkingMessages && len(textParts) > segmentStart {
-				if e.display.Mode == "quiet" {
-					if sp.canPreview() && sp.appendSeparator("\n\n") {
+			if !showThinking && len(textParts) > segmentStart {
+				if displayMode == "quiet" {
+					if sp.canPreview() {
+						if sp.appendSeparator("\n\n") {
+							textParts = append(textParts, "\n\n")
+						}
+					} else if statusMsg.Active() && !strings.HasSuffix(textParts[len(textParts)-1], "\n\n") {
+						// Status-message turns keep narration between tool
+						// calls in one final reply; separate the segments.
 						textParts = append(textParts, "\n\n")
 					}
 				} else {
@@ -5428,7 +5462,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				silentHold = false
 			}
-			if e.display.ThinkingMessages && accumulatedThinking != "" {
+			if showThinking && accumulatedThinking != "" {
 				// --- StreamingCard path ---
 				if streamCard != nil && !streamCard.Failed() {
 					cardThinkingText = truncateIf(accumulatedThinking, e.display.ThinkingMaxLen)
@@ -5464,9 +5498,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		case EventToolUse:
 			thinkingAcc.Reset()
 			toolCount++
+			statusMsg.Tool(event.ToolName, event.ToolInput)
 			if hasRichCard {
 				// When tool messages are suppressed, skip card updates on tool events.
-				if !e.display.ToolMessages {
+				if !showTools {
 					break
 				}
 				toolSteps = append(toolSteps, ToolStep{
@@ -5495,9 +5530,15 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// When tool messages are hidden, behavior depends on display mode:
 			//   quiet:   append separator to keep all text in one card
 			//   compact: freeze+detach to split text into separate cards
-			if !e.display.ToolMessages && len(textParts) > segmentStart {
-				if e.display.Mode == "quiet" {
-					if sp.canPreview() && sp.appendSeparator("\n\n") {
+			if !showTools && len(textParts) > segmentStart {
+				if displayMode == "quiet" {
+					if sp.canPreview() {
+						if sp.appendSeparator("\n\n") {
+							textParts = append(textParts, "\n\n")
+						}
+					} else if statusMsg.Active() && !strings.HasSuffix(textParts[len(textParts)-1], "\n\n") {
+						// Status-message turns keep narration between tool
+						// calls in one final reply; separate the segments.
 						textParts = append(textParts, "\n\n")
 					}
 				} else {
@@ -5516,7 +5557,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				silentHold = false
 			}
-			if e.display.ToolMessages {
+			if showTools {
 				// --- StreamingCard path ---
 				if streamCard != nil && !streamCard.Failed() {
 					toolInput := event.ToolInput
@@ -5593,7 +5634,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 		case EventToolResult:
-			if e.display.ToolMessages {
+			if showTools {
 				result := strings.TrimSpace(event.ToolResult)
 				if result == "" {
 					result = strings.TrimSpace(event.Content)
@@ -5642,6 +5683,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		case EventText:
 			thinkingAcc.Reset()
 			content := event.Content
+			if content != "" {
+				statusMsg.Writing()
+			}
 			if e.display.HideAgentFooter {
 				content = stripAgentFooterLines(content)
 			}
@@ -5893,6 +5937,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 			thinkingAcc.Reset()
 			cp.Finalize(ProgressCardStateCompleted)
+			// Close the status message before the final reply is sent so the
+			// reply arrives as a separate, newer message.
+			statusMsg.Finish(true)
 			// Use state.agentSession.CurrentSessionID() instead of event.SessionID.
 			// event.SessionID may be empty in some cases, causing the agent_session_id
 			// to not be persisted to disk, breaking session resume on next startup.
@@ -5925,7 +5972,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// When tool progress is hidden, segmentStart stays 0 and textParts
 			// contains ALL text across tool boundaries. Prefer the full accumulated
 			// text over event.Content which only contains the last assistant segment.
-			if len(textParts) > 0 && segmentStart == 0 && !e.display.ToolMessages {
+			if len(textParts) > 0 && segmentStart == 0 && !showTools {
 				fullResponse = strings.Join(textParts, "")
 			} else if fullResponse == "" && len(textParts) > 0 {
 				fullResponse = strings.Join(textParts, "")
@@ -6375,8 +6422,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				}
 
+				startStatus(queued.platform, queued.replyCtx)
+
 				// Send instant reply for queued turn if no streaming card is active.
-				if e.instantReply.Enabled && streamCard == nil {
+				if e.instantReply.Enabled && streamCard == nil && !statusMsg.Active() {
 					replyContent := e.instantReply.Content
 					if replyContent == "" {
 						replyContent = e.i18n.T(MsgStarting)
