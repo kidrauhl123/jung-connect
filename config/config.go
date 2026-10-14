@@ -209,6 +209,9 @@ type DisplayConfig struct {
 	StatusIntervalSecs *int    `toml:"status_interval_secs"` // min seconds between edits; default 3
 	StatusStuckMins    *int    `toml:"status_stuck_mins"`    // minutes without progress before "可能卡住"; default 3
 	StatusOnDone       *string `toml:"status_on_done"`       // "summary" (default) or "delete"
+	// ContextLine prepends "[context] platform · channel · thread · binding"
+	// to every prompt sent to the agent (never shown in IM). Default true.
+	ContextLine *bool `toml:"context_line"`
 }
 
 // StreamPreviewConfig controls real-time streaming preview in IM.
@@ -4099,4 +4102,15 @@ func validateChannels(prefix string, chans []ChannelConfig) error {
 		seen[m] = true
 	}
 	return nil
+}
+
+// EffectiveContextLine resolves [display] context_line: project > global > true.
+func EffectiveContextLine(cfg *Config, proj *ProjectConfig) bool {
+	if proj != nil && proj.Display != nil && proj.Display.ContextLine != nil {
+		return *proj.Display.ContextLine
+	}
+	if cfg != nil && cfg.Display.ContextLine != nil {
+		return *cfg.Display.ContextLine
+	}
+	return true
 }

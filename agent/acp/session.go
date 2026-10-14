@@ -41,6 +41,9 @@ type acpSession struct {
 	// resume, or session/load failed). pendingPromptPrefix is prepended to
 	// the next Send exactly once (guarded by sendMu).
 	startedNew          atomic.Bool
+	// resumeLost is set when a resume was requested but the previous
+	// session could not be restored; surfaced once via StartupWarning.
+	resumeLost atomic.Bool
 	pendingPromptPrefix string
 
 	cmd *exec.Cmd
@@ -261,19 +264,32 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 		loadRes, err := s.tr.call(s.ctx, "session/load", loadParams)
 		s.loading.Store(false)
 		if err != nil {
-			slog.Warn("acp: session/load failed, starting new session", "error", err)
+			slog.Warn("acp: session/load failed, starting new session; previous context is lost",
+				"session_id", resumeSessionID, "error", err)
+			s.resumeLost.Store(true)
 		} else {
+			// ACP's session/load result carries no sessionId (grok 1.0.52
+			// omits it). A successful load means the requested session is
+			// live, so keep the requested ID unless the server names another.
 			var lr struct {
 				SessionID string         `json:"sessionId"`
 				Modes     *acpModesBlock `json:"modes"`
 			}
-			if json.Unmarshal(loadRes, &lr) == nil && lr.SessionID != "" {
-				s.setACPSessionID(lr.SessionID)
-				s.absorbModes(lr.Modes)
-				s.absorbModelsMeta(loadRes)
-				return nil
+			_ = json.Unmarshal(loadRes, &lr)
+			sid := lr.SessionID
+			if sid == "" {
+				sid = resumeSessionID
 			}
+			s.setACPSessionID(sid)
+			s.absorbModes(lr.Modes)
+			s.absorbModelsMeta(loadRes)
+			slog.Info("acp: session resumed", "session_id", sid)
+			return nil
 		}
+	} else if wantResume {
+		slog.Warn("acp: agent does not support session/load; starting new session",
+			"session_id", resumeSessionID)
+		s.resumeLost.Store(true)
 	}
 
 	newParams := map[string]any{
@@ -905,4 +921,13 @@ func summarizeACPToolInput(kind string, raw json.RawMessage) string {
 	}
 	b, _ := json.MarshalIndent(m, "", "  ")
 	return string(b)
+}
+
+// StartupWarning implements core.StartupWarner: tells the IM user once when
+// a requested resume failed and the conversation context was not restored.
+func (s *acpSession) StartupWarning() string {
+	if s.resumeLost.Swap(false) {
+		return "⚠️ 上一轮会话没能恢复，已开新会话（之前的上下文不在了）。"
+	}
+	return ""
 }

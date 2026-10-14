@@ -724,3 +724,16 @@ func ProgressReplyCtx(p Platform, replyCtx any) any {
 	}
 	return replyCtx
 }
+
+// LiveModelSwitcher is an optional AgentSession interface for switching the
+// model of a running session in place (ACP session/set_config_option),
+// keeping the process and conversation context.
+type LiveModelSwitcher interface {
+	SetLiveModel(model string) bool
+}
+
+// LiveReasoningSwitcher is the reasoning-effort counterpart of
+// LiveModelSwitcher.
+type LiveReasoningSwitcher interface {
+	SetLiveReasoningEffort(effort string) bool
+}
