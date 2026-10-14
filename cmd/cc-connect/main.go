@@ -573,6 +573,7 @@ func main() {
 				ToolMessages:     tool,
 				HistoryMaxLen:    &historyMaxLen,
 				HideAgentFooter:  hideAgentFooter,
+				NoContextLine:    !config.EffectiveContextLine(cfg, &proj),
 			})
 		}
 		applyStatusMessageConfig(engine, cfg, &proj)
@@ -1775,6 +1776,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 		ToolMessages:     tool,
 		HistoryMaxLen:    &historyMaxLen,
 		HideAgentFooter:  hideAgentFooter,
+		NoContextLine:    !config.EffectiveContextLine(cfg, proj),
 	})
 	result.DisplayUpdated = true
 	applyStatusMessageConfig(engine, cfg, proj)

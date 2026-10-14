@@ -338,6 +338,7 @@ type DisplayCfg struct {
 	ToolMessages     bool
 	HistoryMaxLen    *int // max runes for /history entries; nil = default, 0 = no truncation
 	HideAgentFooter  bool // strip model/token footer lines emitted as agent text
+	NoContextLine    bool // disable the per-turn "[context] ..." line sent to the agent
 }
 
 // InstantReplyCfg controls the immediate confirmation reply sent when a message
@@ -545,6 +546,9 @@ type interactiveState struct {
 	// first prompt of a freshly started session for agents without native
 	// channel-profile support (see ChannelProfileInjector).
 	pendingChannelContext    string
+	// pendingLiveChanges are /model or /reasoning switches requested while
+	// a turn was running; applied in place before the next turn.
+	pendingLiveChanges       []pendingLiveChange
 	platform                 Platform
 	replyCtx                 any
 	currentMessageID         string
@@ -3919,7 +3923,10 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		drainEvents(state.agentSession.Events())
 	}
 
+	applyPendingLiveChanges(state)
+
 	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
+	promptContent = e.sessionContextLine(p, msg) + promptContent
 
 	sendStart := time.Now()
 	state.mu.Lock()
@@ -10102,9 +10109,11 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 			return
 		}
 		sessions.GetOrCreateActive(msg.SessionKey).SetModelOverride(target)
-		e.cleanupInteractiveState(interactiveKey)
-		// Keep the agent session ID: the next StartSession resumes the same
-		// conversation with the per-session model.
+		if e.applyLiveSessionChange(msg.SessionKey, sessions, "model="+target, liveModelFn(target)).needsRestart() {
+			// Keep the agent session ID: the next StartSession resumes the
+			// same conversation with the per-session model.
+			e.cleanupInteractiveState(interactiveKey)
+		}
 		sessions.Save()
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgModelChangedSession, target))
 		return
@@ -10119,7 +10128,9 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 	// A global switch also drops this session's own override so the new
 	// default takes effect here too.
 	sessions.GetOrCreateActive(msg.SessionKey).SetModelOverride("")
-	e.cleanupInteractiveState(interactiveKey)
+	if e.applyLiveSessionChange(msg.SessionKey, sessions, "model="+target, liveModelFn(target)).needsRestart() {
+		e.cleanupInteractiveState(interactiveKey)
+	}
 
 	// Keep the existing agent session ID so the next StartSession uses
 	// --resume <id> --model <new>, which lets the CLI agent restore context
@@ -10536,11 +10547,11 @@ func (e *Engine) cmdReasoning(p Platform, msg *Message, args []string) {
 	}
 
 	switcher.SetReasoningEffort(target)
-	e.cleanupInteractiveState(e.interactiveKeyForSessionKey(msg.SessionKey))
-
-	s := sessions.GetOrCreateActive(msg.SessionKey)
-	s.SetAgentSessionID("", "")
-	s.ClearHistory()
+	// Keep the agent session: apply in place when live, otherwise the next
+	// StartSession resumes it with the new effort.
+	if e.applyLiveSessionChange(msg.SessionKey, sessions, "reasoning="+target, liveReasoningFn(target)).needsRestart() {
+		e.cleanupInteractiveState(e.interactiveKeyForSessionKey(msg.SessionKey))
+	}
 	sessions.Save()
 
 	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgReasoningChanged, target))
@@ -12721,7 +12732,9 @@ func (e *Engine) handleModelCardAction(args, sessionKey string) *Card {
 			return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", e.i18n.T(MsgModelSessionNotSupported))
 		}
 		sessions.GetOrCreateActive(sessionKey).SetModelOverride(target)
-		e.cleanupInteractiveState(interactiveKey)
+		if e.applyLiveSessionChange(sessionKey, sessions, "model="+target, liveModelFn(target)).needsRestart() {
+			e.cleanupInteractiveState(interactiveKey)
+		}
 		sessions.Save()
 		return NewCard().
 			Title(e.i18n.T(MsgCardTitleModel), "green").
@@ -12734,8 +12747,12 @@ func (e *Engine) handleModelCardAction(args, sessionKey string) *Card {
 	if err == nil {
 		e.persistWorkspaceModelOverride(interactiveKey, sessionKey, agent, resolved)
 		sessions.GetOrCreateActive(sessionKey).SetModelOverride("")
+		if e.applyLiveSessionChange(sessionKey, sessions, "model="+resolved, liveModelFn(resolved)).needsRestart() {
+			e.cleanupInteractiveState(interactiveKey)
+		}
+	} else {
+		e.cleanupInteractiveState(interactiveKey)
 	}
-	e.cleanupInteractiveState(interactiveKey)
 	if err == nil {
 		sessions.Save()
 	}
@@ -12844,10 +12861,9 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		for _, effort := range efforts {
 			if effort == target {
 				switcher.SetReasoningEffort(target)
-				e.cleanupInteractiveState(interactiveKey)
-				s := e.sessions.GetOrCreateActive(sessionKey)
-				s.SetAgentSessionID("", "")
-				s.ClearHistory()
+				if e.applyLiveSessionChange(sessionKey, e.sessions, "reasoning="+target, liveReasoningFn(target)).needsRestart() {
+					e.cleanupInteractiveState(interactiveKey)
+				}
 				e.sessions.Save()
 				return
 			}
