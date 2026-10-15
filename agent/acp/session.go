@@ -30,6 +30,12 @@ type acpSession struct {
 	wg      sync.WaitGroup
 	alive   atomic.Bool
 
+	// liveModel / liveEffort track what the running session actually uses
+	// (initial resolved value, updated on successful live switches) so the
+	// reply footer doesn't fall back to the agent's global default.
+	liveModel  atomic.Value // string
+	liveEffort atomic.Value // string
+
 	usage acpUsageState // latest usage_update
 	// loading is set while session/load waits for its result. Grok replays the
 	// whole transcript as session/update notifications before that result.
@@ -40,10 +46,10 @@ type acpSession struct {
 	// startedNew is set when the handshake created a fresh session (no
 	// resume, or session/load failed). pendingPromptPrefix is prepended to
 	// the next Send exactly once (guarded by sendMu).
-	startedNew          atomic.Bool
+	startedNew atomic.Bool
 	// resumeLost is set when a resume was requested but the previous
 	// session could not be restored; surfaced once via StartupWarning.
-	resumeLost atomic.Bool
+	resumeLost          atomic.Bool
 	pendingPromptPrefix string
 
 	cmd *exec.Cmd
@@ -180,6 +186,12 @@ func newACPSession(ctx context.Context, cfg acpSessionConfig) (*acpSession, erro
 	// Apply pending model preference after handshake. Important on
 	// session/load resume where CLI `-m` alone may not override the
 	// session's previously selected model.
+	if m := strings.TrimSpace(cfg.initialModel); m != "" {
+		s.liveModel.Store(m)
+	}
+	if ef := normalizeReasoningEffort(cfg.initialEffort); ef != "" {
+		s.liveEffort.Store(ef)
+	}
 	if strings.TrimSpace(cfg.initialModel) != "" {
 		if ok := s.SetLiveModel(cfg.initialModel); !ok {
 			slog.Warn("acp: initial model could not be applied",
@@ -436,6 +448,7 @@ func (s *acpSession) SetLiveModel(model string) bool {
 		)
 		return false
 	}
+	s.liveModel.Store(model)
 	slog.Info("acp: live model applied", "model", model, "session_id", sid)
 	return true
 }
@@ -461,6 +474,7 @@ func (s *acpSession) SetLiveReasoningEffort(effort string) bool {
 		)
 		return false
 	}
+	s.liveEffort.Store(effort)
 	slog.Info("acp: live reasoning effort applied", "reasoning_effort", effort, "session_id", sid)
 	return true
 }
@@ -930,4 +944,17 @@ func (s *acpSession) StartupWarning() string {
 		return "⚠️ 上一轮会话没能恢复，已开新会话（之前的上下文不在了）。"
 	}
 	return ""
+}
+
+// GetModel returns the model the live session is running with ("" if
+// unknown, letting the footer fall back to the agent default).
+func (s *acpSession) GetModel() string {
+	v, _ := s.liveModel.Load().(string)
+	return v
+}
+
+// GetReasoningEffort returns the live session's reasoning effort ("" if unknown).
+func (s *acpSession) GetReasoningEffort() string {
+	v, _ := s.liveEffort.Load().(string)
+	return v
 }
