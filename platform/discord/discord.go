@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 	"sync"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/chenhg5/cc-connect/core"
 
@@ -1795,6 +1797,9 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 	if !ok {
 		return fmt.Errorf("discord: invalid preview handle type %T", previewHandle)
 	}
+	if err := checkDiscordEditFits(content); err != nil {
+		return err
+	}
 	_, err := p.session.ChannelMessageEditComplex(buildDiscordPreviewEdit(h.channelID, h.messageID, content))
 	if err != nil {
 		return fmt.Errorf("discord: edit message: %w", err)
@@ -2208,3 +2213,21 @@ func (p *Platform) StatusMessagePreference() (bool, bool) {
 }
 
 var _ core.StatusMessagePreference = (*Platform)(nil)
+
+// errDiscordEditTooLong is returned by UpdateMessage when plain-text content
+// would not fit in one Discord message. Editing would silently cut it at
+// maxDiscordLen ("…"), and the stream-preview finish path would treat that
+// as a successful final delivery, dropping the rest of the reply. Returning
+// an error makes finish delete the preview and send the full text through
+// the normal split-aware Send path.
+var errDiscordEditTooLong = errors.New("discord: edit content exceeds single-message limit")
+
+func checkDiscordEditFits(content string) error {
+	if _, ok := core.ParseProgressCardPayload(content); ok {
+		return nil
+	}
+	if utf8.RuneCountInString(strings.TrimSpace(content)) > maxDiscordLen {
+		return errDiscordEditTooLong
+	}
+	return nil
+}
