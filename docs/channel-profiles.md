@@ -58,5 +58,5 @@ keyed by `match`) instead of changing the workspace default. Precedence for new
 sessions: per-channel `/model` choice → `model` from config → workspace/project
 default.
 
-Known limitation: the `/model` card's "current" marker shows the workspace
-agent's model, not the channel override.
+The `/model` card and button menu mark the model the session actually runs
+with: session `/model` override → channel model → workspace/project default.
