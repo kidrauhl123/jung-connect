@@ -10770,7 +10770,8 @@ func (e *Engine) replyModelVendorButtonsPage(p Platform, msg *Message, switcher 
 	fetchCtx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
 	defer cancel()
 	models := switcher.AvailableModels(fetchCtx)
-	current := switcher.GetModel()
+	_, scopeSessions := e.sessionContextForKey(msg.SessionKey)
+	current := e.effectiveModelForSession(msg.SessionKey, switcher, scopeSessions)
 
 	var sb strings.Builder
 	if current == "" {
@@ -10779,7 +10780,6 @@ func (e *Engine) replyModelVendorButtonsPage(p Platform, msg *Message, switcher 
 		sb.WriteString(e.i18n.Tf(MsgModelCurrent, current))
 		sb.WriteString("\n")
 	}
-	_, scopeSessions := e.sessionContextForKey(msg.SessionKey)
 	sb.WriteString(e.modelScopesLine(msg.SessionKey, switcher, scopeSessions))
 	sb.WriteString("\n\n")
 
@@ -10962,19 +10962,41 @@ func (e *Engine) modelScopesLine(sessionKey string, switcher ModelSwitcher, sess
 		}
 		return v
 	}
-	sessionModel := ""
+	sessionModel, channelModel := e.modelScopes(sessionKey, sessions)
+	return e.i18n.Tf(MsgModelScopes, orUnset(sessionModel), orUnset(channelModel), orUnset(switcher.GetModel()))
+}
+
+// modelScopes returns the active session's /model override and the channel
+// profile model for sessionKey (either may be empty).
+func (e *Engine) modelScopes(sessionKey string, sessions *SessionManager) (sessionModel, channelModel string) {
 	if sessions != nil && sessionKey != "" {
 		if id := sessions.ActiveSessionID(sessionKey); id != "" {
 			if s := sessions.FindByID(id); s != nil {
-				sessionModel = s.GetModelOverride()
+				sessionModel = strings.TrimSpace(s.GetModelOverride())
 			}
 		}
 	}
-	channelModel := ""
 	if sessionKey != "" {
-		channelModel = e.effectiveChannelModel(e.channelProfileForSessionKey(sessionKey))
+		channelModel = strings.TrimSpace(e.effectiveChannelModel(e.channelProfileForSessionKey(sessionKey)))
 	}
-	return e.i18n.Tf(MsgModelScopes, orUnset(sessionModel), orUnset(channelModel), orUnset(switcher.GetModel()))
+	return sessionModel, channelModel
+}
+
+// effectiveModelForSession is the model a turn in sessionKey actually runs
+// with: session override > channel profile model > agent default. The /model
+// menus mark this one as current.
+func (e *Engine) effectiveModelForSession(sessionKey string, switcher ModelSwitcher, sessions *SessionManager) string {
+	sessionModel, channelModel := e.modelScopes(sessionKey, sessions)
+	if sessionModel != "" {
+		return sessionModel
+	}
+	if channelModel != "" {
+		return channelModel
+	}
+	if switcher == nil {
+		return ""
+	}
+	return switcher.GetModel()
 }
 
 func parseModelSwitchArgs(args []string) (string, bool) {
@@ -14303,6 +14325,10 @@ func (e *Engine) renderModelCard(sessionKey string, vendorKey string) *Card {
 	defer cancel()
 	models := switcher.AvailableModels(fetchCtx)
 	current := switcher.GetModel()
+	if sessionKey != "" {
+		_, cardSessions := e.sessionContextForKey(sessionKey)
+		current = e.effectiveModelForSession(sessionKey, switcher, cardSessions)
+	}
 	groups := GroupModelsByVendor(models)
 
 	var sb strings.Builder
