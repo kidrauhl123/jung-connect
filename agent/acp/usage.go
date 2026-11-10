@@ -404,3 +404,33 @@ func metaKeyList(meta json.RawMessage) []string {
 	}
 	return keys
 }
+
+// absorbPromptResultUsage folds the standard session/prompt result
+// `usage` block ({inputTokens, outputTokens, totalTokens, cachedReadTokens})
+// into the current snapshot without overriding UsedTokens, which comes from
+// the context-size sources above.
+func (s *acpSession) absorbPromptResultUsage(res json.RawMessage) {
+	var pr struct {
+		Usage struct {
+			InputTokens      int `json:"inputTokens"`
+			OutputTokens     int `json:"outputTokens"`
+			TotalTokens      int `json:"totalTokens"`
+			CachedReadTokens int `json:"cachedReadTokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(res, &pr) != nil || (pr.Usage.InputTokens <= 0 && pr.Usage.TotalTokens <= 0) {
+		return
+	}
+	st := s.usageState()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.usage == nil {
+		st.usage = &core.ContextUsage{ContextWindow: st.window}
+	}
+	if pr.Usage.CachedReadTokens > 0 {
+		st.usage.CachedInputTokens = pr.Usage.CachedReadTokens
+	}
+	st.usage.InputTokens = pr.Usage.InputTokens
+	st.usage.OutputTokens = pr.Usage.OutputTokens
+	st.usage.TotalTokens = pr.Usage.TotalTokens
+}

@@ -418,7 +418,7 @@ func TestProcessInteractiveEvents_StatusMessageOffKeepsToolMessages(t *testing.T
 
 	as.events <- Event{Type: EventToolUse, ToolName: "bash", ToolInput: "ls"}
 	as.events <- Event{Type: EventResult, Content: "done", Done: true}
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil, 0)
 
 	starts, _, _ := p.snapshot()
 	for _, s := range starts {
@@ -455,7 +455,7 @@ func runGapTurn(t *testing.T, status bool, preview bool) (*statusFakePlatform, [
 		as.events <- Event{Type: EventToolUse, ToolName: "bash", ToolInput: "pwd"}
 		as.events <- Event{Type: EventResult, Content: "", Done: true}
 	}()
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil, 0)
 	starts, edits, _ := p.snapshot()
 	all := append(append(append([]string{}, starts...), edits...), p.getSent()...)
 	return p, all

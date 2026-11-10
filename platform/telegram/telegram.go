@@ -388,7 +388,7 @@ func newBotWithServerURL(token, apiBase string, onUpdate func(context.Context, *
 	// This clears any outstanding long-poll request from a previous instance.
 	drainPendingUpdates(token, apiBase, httpClient)
 
-	return b, me, b.Start, nil
+	return newRateLimitRetryBot(b), me, b.Start, nil
 }
 
 // drainPendingUpdates clears any pending updates on Telegram's side by calling

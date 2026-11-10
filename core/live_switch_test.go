@@ -36,7 +36,8 @@ func TestApplyLiveSessionChange(t *testing.T) {
 
 	// Busy: deferred, then applied at next turn.
 	s := e.sessions.GetOrCreateActive(key)
-	if !s.TryLock() {
+	gen, ok := s.TryLock()
+	if !ok {
 		t.Fatal("lock")
 	}
 	if r := e.applyLiveSessionChange(key, e.sessions, "r", liveReasoningFn("high")); r != liveSwitchDeferred {
@@ -45,7 +46,7 @@ func TestApplyLiveSessionChange(t *testing.T) {
 	if len(as.efforts) != 0 {
 		t.Fatal("must not apply mid-turn")
 	}
-	s.Unlock()
+	s.Unlock(gen)
 	applyPendingLiveChanges(e.interactiveStates[e.interactiveKeyForSessionKey(key)])
 	if len(as.efforts) != 1 || as.efforts[0] != "high" {
 		t.Fatalf("efforts = %v", as.efforts)

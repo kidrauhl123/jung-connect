@@ -98,7 +98,7 @@ func runSegTurn(t *testing.T, p *segFakePlatform, display DisplayCfg, preview bo
 			time.Sleep(5 * time.Millisecond)
 		}
 	}()
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, "ctx")
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, "ctx", 0)
 }
 
 var compactHidden = DisplayCfg{Mode: "compact", ThinkingMessages: false, ToolMessages: false}
