@@ -330,3 +330,16 @@ func TestMapSessionUpdate_AgentThoughtChunkIsThinking(t *testing.T) {
 		t.Fatalf("want 1 thinking event, got %+v", evs)
 	}
 }
+
+func TestMapSessionUpdate_agentThoughtChunk(t *testing.T) {
+	params := json.RawMessage(`{"sessionId":"s1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"x"}}}`)
+	evs := mapSessionUpdate("", params)
+	if len(evs) != 1 || evs[0].Type != core.EventThinking || evs[0].Content != "x" {
+		t.Fatalf("expected thinking event, got %+v", evs)
+	}
+	for _, ev := range evs {
+		if ev.Type == core.EventText {
+			t.Fatalf("thought leaked into text: %+v", ev)
+		}
+	}
+}

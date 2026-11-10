@@ -25,7 +25,7 @@ func (e *Engine) sessionContextLine(p Platform, msg *Message) string {
 	if where == "" {
 		id := msg.ChannelID
 		if id == "" {
-			id = extractWorkspaceChannelKey(msg.SessionKey)
+			id = e.extractWorkspaceChannelKey(msg.SessionKey)
 		}
 		if name := strings.TrimSpace(msg.ChatName); name != "" {
 			where = name + " (" + id + ")"

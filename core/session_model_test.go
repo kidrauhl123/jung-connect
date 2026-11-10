@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -171,5 +172,40 @@ func TestSessionModel_SurvivesConfigReloadAndRestart(t *testing.T) {
 	reloaded := NewSessionManager(store)
 	if got := reloaded.GetOrCreateActive("test:u1").GetModelOverride(); got != "sess-m" {
 		t.Fatalf("override not persisted: %q", got)
+	}
+}
+
+// The /model menus must mark the model the session actually runs with
+// (session override > channel profile > global), not the agent default.
+func TestModelMenus_CurrentReflectsChannelAndSessionOverride(t *testing.T) {
+	e, agent, p := newSessionModelEngine(t)
+	e.SetChannelProfiles([]ChannelProfile{{Match: "discord:PARENT", Model: "chan-m"}})
+	key := "discord:PARENT:u1"
+	e.channelProfileForMessage(&Message{Platform: "discord", SessionKey: key})
+	sw := ModelSwitcher(agent)
+
+	currentLine := func(m string) string { return e.i18n.Tf(MsgModelCurrent, m) }
+	cardText := func() string { return fmt.Sprintf("%+v", e.renderModelCard(key, "").Elements) }
+
+	if got := e.effectiveModelForSession(key, sw, e.sessions); got != "chan-m" {
+		t.Fatalf("effective = %q, want chan-m", got)
+	}
+	if c := cardText(); !strings.Contains(c, currentLine("chan-m")) || strings.Contains(c, currentLine("global-m")) {
+		t.Fatalf("card current should be channel model, got %s", c)
+	}
+
+	e.replyModelVendorButtonsPage(p, &Message{SessionKey: key, ReplyCtx: "ctx"}, sw, "", 1)
+	if all := strings.Join(p.getSent(), "\n"); !strings.Contains(all, currentLine("chan-m")) {
+		t.Fatalf("button menu current should be channel model, got %q", all)
+	}
+
+	e.sessions.GetOrCreateActive(key).SetModelOverride("sess-m")
+	if c := cardText(); !strings.Contains(c, currentLine("sess-m")) {
+		t.Fatalf("card current should be session override, got %s", c)
+	}
+
+	// No channel profile and no override: global default.
+	if got := e.effectiveModelForSession("test:other", sw, e.sessions); got != "global-m" {
+		t.Fatalf("effective without overrides = %q, want global-m", got)
 	}
 }

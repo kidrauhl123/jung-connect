@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/chenhg5/cc-connect/agent/kimi"
 	"github.com/chenhg5/cc-connect/core"
 )
 
@@ -74,6 +75,13 @@ type Agent struct {
 	modesCache   []core.PermissionModeInfo
 	modesCurrent string
 
+	// Server-reported model catalog (ACP configOptions id=model, e.g. kimi
+	// acp). a.model stays the configured / --global default and wins in
+	// GetModel; per-session /model overrides live in the engine.
+	modelsMu     sync.RWMutex
+	modelsCache  []core.ModelOption
+	currentModel string
+
 	mu sync.RWMutex
 }
 
@@ -84,6 +92,7 @@ type Agent struct {
 type sessionCallbacks interface {
 	reportModes(block acpModesBlock)
 	reportListSupported(supported bool)
+	reportModels(current string, models []core.ModelOption)
 }
 
 // Ensure *Agent satisfies sessionCallbacks at compile time.
@@ -355,6 +364,27 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 
 func (a *Agent) Stop() error { return nil }
 
+// GetSessionHistory implements core.HistoryProvider. ACP itself defines no
+// history retrieval RPC, but backends like Kimi Code CLI (`kimi acp`) persist
+// transcripts locally; read them so /last and /history work after /switch.
+// For non-Kimi backends this reports "session not found", which the engine
+// surfaces as an ordinary lookup failure.
+func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int) ([]core.HistoryEntry, error) {
+	a.mu.RLock()
+	extra := append([]string(nil), a.extraEnv...)
+	extra = append(extra, a.sessionEnv...)
+	a.mu.RUnlock()
+	return kimi.ReadSessionHistory(sessionID, limit, extra...)
+}
+
+var _ core.HistoryProvider = (*Agent)(nil)
+
+// CompressCommand implements core.ContextCompressor. ACP has no dedicated
+// compaction RPC; servers that support compaction (e.g. kimi acp) intercept
+// "/compact" as a builtin slash command inside session/prompt. Servers
+// without it answer with an "unknown command" notice, which is harmless.
+func (a *Agent) CompressCommand() string { return "/compact" }
+
 // -- AgentDoctorInfo --
 
 func (a *Agent) CLIBinaryName() string {
@@ -389,8 +419,21 @@ func (a *Agent) SetModel(model string) {
 
 func (a *Agent) GetModel() string {
 	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return a.model
+	m := a.model
+	a.mu.RUnlock()
+	if m != "" {
+		return m
+	}
+	// No configured default: report what the server says is active.
+	a.modelsMu.RLock()
+	defer a.modelsMu.RUnlock()
+	if a.currentModel != "" {
+		return a.currentModel
+	}
+	if len(a.modelsCache) > 0 {
+		return a.modelsCache[0].Name
+	}
+	return ""
 }
 
 func normalizeReasoningEffort(raw string) string {
@@ -422,6 +465,10 @@ func (a *Agent) AvailableReasoningEfforts() []string {
 
 func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
 	if models := a.fetchModelsFromAPI(ctx); len(models) > 0 {
+		return models
+	}
+	// Catalog advertised by the ACP server itself (configOptions id=model).
+	if models := a.serverModels(); len(models) > 0 {
 		return models
 	}
 	if models := fetchModelsFromGrokCLI(ctx); len(models) > 0 {
@@ -779,4 +826,28 @@ func (a *Agent) reportListSupported(supported bool) {
 	} else {
 		a.listUnsupported.Store(false)
 	}
+}
+
+func (a *Agent) reportModels(current string, models []core.ModelOption) {
+	if len(models) == 0 {
+		return
+	}
+	a.modelsMu.Lock()
+	a.modelsCache = models
+	if current != "" {
+		a.currentModel = current
+	}
+	a.modelsMu.Unlock()
+}
+
+// serverModels returns a copy of the server-reported model catalog.
+func (a *Agent) serverModels() []core.ModelOption {
+	a.modelsMu.RLock()
+	defer a.modelsMu.RUnlock()
+	if len(a.modelsCache) == 0 {
+		return nil
+	}
+	out := make([]core.ModelOption, len(a.modelsCache))
+	copy(out, a.modelsCache)
+	return out
 }

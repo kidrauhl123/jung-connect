@@ -203,12 +203,12 @@ func (e *Engine) rememberSessionChannel(sessionKey, channelKey string) {
 
 // channelKeysForMessage returns match candidates for a message: the exact
 // channel/thread first, then the platform-provided parent channel key.
-func channelKeysForMessage(msg *Message) []string {
+func (e *Engine) channelKeysForMessage(msg *Message) []string {
 	if msg == nil {
 		return nil
 	}
-	exact := extractWorkspaceChannelKey(msg.SessionKey)
-	parent := effectiveWorkspaceChannelKey(msg)
+	exact := e.extractWorkspaceChannelKey(msg.SessionKey)
+	parent := e.effectiveWorkspaceChannelKey(msg)
 	if exact == parent {
 		return []string{exact}
 	}
@@ -221,7 +221,7 @@ func (e *Engine) channelProfileForMessage(msg *Message) *ChannelProfile {
 	if msg == nil {
 		return nil
 	}
-	keys := channelKeysForMessage(msg)
+	keys := e.channelKeysForMessage(msg)
 	if len(keys) > 0 {
 		e.rememberSessionChannel(msg.SessionKey, keys[len(keys)-1])
 	}
@@ -251,7 +251,7 @@ func (e *Engine) channelProfileForSessionKey(sessionKey string) *ChannelProfile 
 	if empty {
 		return nil
 	}
-	return e.channelProfileFor(extractWorkspaceChannelKey(sessionKey), parent)
+	return e.channelProfileFor(e.extractWorkspaceChannelKey(sessionKey), parent)
 }
 
 // channelWorkDirForKey returns a configured work_dir for a channel key, if any.
