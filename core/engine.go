@@ -560,10 +560,10 @@ type interactiveState struct {
 	// pendingChannelContext is a <channel-context> block prepended to the
 	// first prompt of a freshly started session for agents without native
 	// channel-profile support (see ChannelProfileInjector).
-	pendingChannelContext    string
+	pendingChannelContext string
 	// pendingLiveChanges are /model or /reasoning switches requested while
 	// a turn was running; applied in place before the next turn.
-	pendingLiveChanges       []pendingLiveChange
+	pendingLiveChanges []pendingLiveChange
 	// busySession is the core.Session whose busy lock guards the in-flight
 	// turn. Set by getOrCreateInteractiveStateWith so /stop can release the
 	// lock after tearing the turn down (#1830).
@@ -4209,9 +4209,17 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	e.stopUnsolicitedReader(state)
 	state.mu.Lock()
 	needResync := state.eventsNeedResync
+	cancelled := state.turnCancelled
 	state.mu.Unlock()
 	if needResync {
-		drainEvents(state.agentSession.Events())
+		if cancelled {
+			// After /stop, the cancelled turn can still emit late chunks.
+			// A single non-blocking drain misses stragglers, which would
+			// then be mistaken for the new turn's reply.
+			drainEventsUntilQuiet(state.agentSession.Events(), 80*time.Millisecond, 750*time.Millisecond)
+		} else {
+			drainEvents(state.agentSession.Events())
+		}
 	}
 
 	applyPendingLiveChanges(state)
@@ -5383,10 +5391,15 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 					fullResponse = strings.Join(textParts, "")
 				}
 
-				if fullResponse != "" {
+				if strings.TrimSpace(fullResponse) != "" {
 					for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
+						if strings.TrimSpace(chunk) == "" {
+							continue
+						}
 						e.send(p, replyCtx, chunk)
 					}
+				} else {
+					fullResponse = ""
 				}
 
 				// Safety note: concurrent writes to session.History by the
@@ -13188,22 +13201,80 @@ func (e *Engine) sendRaw(p Platform, replyCtx any, content string) {
 // Called before a new turn to prevent stale events from a previous turn's
 // agent process from being mistaken for the new turn's response.
 func drainEvents(ch <-chan Event) {
+	drained := drainEventsNonBlocking(ch)
+	if drained > 0 {
+		slog.Warn("drained stale events from previous turn", "count", drained)
+	}
+}
+
+func drainEventsNonBlocking(ch <-chan Event) int {
 	drained := 0
 	for {
 		select {
 		case _, ok := <-ch:
 			if !ok {
 				// Channel is closed; stop immediately to avoid an infinite loop.
-				return
+				return drained
 			}
 			drained++
 		default:
-			if drained > 0 {
-				slog.Warn("drained stale events from previous turn", "count", drained)
-			}
-			return
+			return drained
 		}
 	}
+}
+
+// drainEventsUntilQuiet discards currently buffered events, then waits until
+// the channel stays quiet for `quiet` or `max` elapses. Used after a cancelled
+// turn so late stream chunks are not treated as the next prompt's reply.
+func drainEventsUntilQuiet(ch <-chan Event, quiet, max time.Duration) int {
+	if quiet <= 0 {
+		quiet = 50 * time.Millisecond
+	}
+	if max <= 0 {
+		max = quiet
+	}
+	deadline := time.Now().Add(max)
+	drained := drainEventsNonBlocking(ch)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			drained += drainEventsNonBlocking(ch)
+			break
+		}
+		wait := quiet
+		if wait > remaining {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case _, ok := <-ch:
+			timer.Stop()
+			if !ok {
+				if drained > 0 {
+					slog.Warn("drained stale events from previous turn", "count", drained)
+				}
+				return drained
+			}
+			drained++
+			drained += drainEventsNonBlocking(ch)
+		case <-timer.C:
+			if drained == 0 {
+				// Nothing arrived and the channel stayed quiet.
+				return 0
+			}
+			// Confirm no straggler landed as the timer fired.
+			extra := drainEventsNonBlocking(ch)
+			if extra == 0 {
+				slog.Warn("drained stale events from previous turn", "count", drained)
+				return drained
+			}
+			drained += extra
+		}
+	}
+	if drained > 0 {
+		slog.Warn("drained stale events from previous turn", "count", drained)
+	}
+	return drained
 }
 
 // replyWithError applies outgoing rate limiting and p.Reply.

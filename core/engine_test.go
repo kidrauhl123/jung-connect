@@ -9074,6 +9074,40 @@ func TestDrainEventsOpenChannel(t *testing.T) {
 	}
 }
 
+func TestDrainEventsUntilQuietCatchesLateEvent(t *testing.T) {
+	ch := make(chan Event, 8)
+	ch <- Event{Type: EventText, Content: "stale-1"}
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		ch <- Event{Type: EventText, Content: "stale-late"}
+		ch <- Event{Type: EventResult, Content: "%", Done: true}
+	}()
+
+	n := drainEventsUntilQuiet(ch, 50*time.Millisecond, 400*time.Millisecond)
+	if n < 3 {
+		t.Fatalf("drained %d, want at least the buffered event plus late leftovers", n)
+	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("expected channel to be quiet after drain, got %+v", ev)
+	default:
+	}
+}
+
+func TestDrainEventsUntilQuietReturnsWhenQuiet(t *testing.T) {
+	ch := make(chan Event, 2)
+	start := time.Now()
+	n := drainEventsUntilQuiet(ch, 40*time.Millisecond, 200*time.Millisecond)
+	elapsed := time.Since(start)
+	if n != 0 {
+		t.Fatalf("drained %d, want 0", n)
+	}
+	if elapsed < 40*time.Millisecond || elapsed > 200*time.Millisecond {
+		t.Fatalf("quiet drain took %v, want around the quiet window", elapsed)
+	}
+}
+
 // --- Message queuing tests ---
 
 // queuingAgentSession records Send calls and emits events via a controllable channel.
@@ -14846,6 +14880,76 @@ func TestUnsolicitedReader_RelaysEventResult(t *testing.T) {
 	state.mu.Unlock()
 	if resync {
 		t.Error("expected eventsNeedResync=false after clean unsolicited EventResult")
+	}
+}
+
+func TestUnsolicitedReader_SkipsWhitespaceOnlyResult(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("unsol-empty")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+
+	sessions := e.sessions
+	session := sessions.GetOrCreateActive("test:empty:u1")
+	state := &interactiveState{
+		agentSession:     sess,
+		platform:         p,
+		replyCtx:         "ctx",
+		eventsNeedResync: false,
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates["test:empty:u1"] = state
+	e.interactiveMu.Unlock()
+
+	e.startUnsolicitedReader(state, session, sessions, "test:empty:u1", "")
+	defer e.stopUnsolicitedReader(state)
+
+	sess.events <- Event{Type: EventText, Content: "\n"}
+	sess.events <- Event{Type: EventResult, Done: true}
+
+	time.Sleep(200 * time.Millisecond)
+	sent := waitForPlatformSend(p, 0, 200*time.Millisecond)
+	for _, s := range sent {
+		if strings.TrimSpace(s) == "" {
+			t.Fatalf("unsolicited reader sent empty/whitespace content: %q", s)
+		}
+		t.Fatalf("unsolicited reader sent unexpected content for whitespace-only turn: %q", s)
+	}
+}
+
+func TestUnsolicitedReader_OneResultSendsJoinedChunksOnce(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("unsol-join")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+
+	sessions := e.sessions
+	session := sessions.GetOrCreateActive("test:join:u1")
+	state := &interactiveState{
+		agentSession:     sess,
+		platform:         p,
+		replyCtx:         "ctx",
+		eventsNeedResync: false,
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates["test:join:u1"] = state
+	e.interactiveMu.Unlock()
+
+	e.startUnsolicitedReader(state, session, sessions, "test:join:u1", "")
+	defer e.stopUnsolicitedReader(state)
+
+	for _, c := range []string{"跑", "完了", "。"} {
+		sess.events <- Event{Type: EventText, Content: c}
+	}
+	sess.events <- Event{Type: EventResult, Done: true}
+
+	sent := waitForPlatformSend(p, 1, 5*time.Second)
+	joined := strings.Join(sent, "")
+	if !strings.Contains(joined, "跑完了。") {
+		t.Fatalf("want one joined reply containing 跑完了。, got %v", sent)
+	}
+	if len(sent) != 1 {
+		t.Fatalf("want a single platform send, got %d: %v", len(sent), sent)
 	}
 }
 

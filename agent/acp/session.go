@@ -79,10 +79,12 @@ type acpSession struct {
 	// promptInFlight tracks active session/prompt RPCs. Text chunks that
 	// arrive while no prompt is in flight belong to background work (kimi
 	// acp runs /compact asynchronously and reports "Compaction completed"
-	// long after the /compact prompt's turn has ended) — they get a
-	// synthetic EventResult so the engine's unsolicited reader relays them
-	// to the platform instead of buffering them until the next turn.
+	// long after the /compact prompt's turn has ended). Those chunks are
+	// aggregated into one background turn and closed with a single
+	// synthetic EventResult at a real turn boundary (turn_completed, or
+	// an idle fallback for agents that never emit one).
 	promptInFlight atomic.Int32
+	bg             backgroundTurn
 
 	callbacks sessionCallbacks // may be nil (tests, integration harness)
 }
@@ -605,27 +607,60 @@ func (s *acpSession) onNotification(method string, params json.RawMessage) {
 		s.maybeAbsorbUsageUpdate(params)
 		s.maybeAbsorbConfigOptionUpdate(params)
 		sid := s.currentACPSessionID()
+		kind := sessionUpdateKind(params)
+		if isExplicitTurnSignal(kind) {
+			s.markExplicitTurnSignal()
+		}
 		slog.Debug("acp: session/update", "session_id", sid, "params", string(params))
+		if s.promptInFlight.Load() == 0 && s.isDroppingCancelled() {
+			// Leftover stream from a cancelled turn must not become the
+			// next foreground reply or a fresh unsolicited message.
+			s.noteCancelledUpdate()
+			if isExplicitTurnEnd(kind) {
+				// The cancelled turn is finished; do not emit EventResult.
+				s.closeBackgroundTurn("cancelled-turn-completed")
+			}
+			break
+		}
 		hasVisible := false
 		for _, ev := range mapSessionUpdate(sid, params) {
 			if ev.Type == core.EventToolResult && toolName != "" {
 				ev.ToolName = toolName
 			}
-			if ev.Type == core.EventText && ev.Content != "" {
+			if ev.Type == core.EventText && strings.TrimSpace(ev.Content) != "" {
 				hasVisible = true
 			}
 			s.emit(ev)
 		}
-		// Out-of-turn text (background work reporting after its turn ended —
-		// e.g. kimi acp's "Compaction completed" chunk) would otherwise sit in
-		// the events buffer until the next foreground turn drains and drops it
-		// as stale. Close it with a synthetic result so the unsolicited reader
-		// relays it immediately.
-		if hasVisible && s.promptInFlight.Load() == 0 {
-			s.emit(core.Event{Type: core.EventResult, SessionID: sid, Done: true})
+		// Out-of-turn text belongs to one background turn. Close it at a
+		// real turn boundary (turn_completed) or, for agents that never
+		// emit one, after the stream goes idle. Never emit EventResult
+		// per chunk — that made Grok streaming deltas each become their
+		// own Discord message.
+		if s.promptInFlight.Load() == 0 {
+			if hasVisible {
+				s.noteBackgroundVisibleText()
+			}
+			if isExplicitTurnEnd(kind) {
+				s.closeBackgroundTurn("turn_completed")
+			}
 		}
 	case "_x.ai/session_notification":
 		s.maybeAbsorbGrokUsageNotification(params)
+		kind := sessionUpdateKind(params)
+		if isExplicitTurnSignal(kind) {
+			s.markExplicitTurnSignal()
+		}
+		if s.promptInFlight.Load() == 0 && s.isDroppingCancelled() {
+			s.noteCancelledUpdate()
+			if isExplicitTurnEnd(kind) {
+				s.closeBackgroundTurn("cancelled-turn-completed")
+			}
+			break
+		}
+		if s.promptInFlight.Load() == 0 && isExplicitTurnEnd(kind) {
+			s.closeBackgroundTurn("turn_completed")
+		}
 	case "_x.ai/models/update":
 		s.absorbModelsMeta(params)
 	default:
@@ -924,6 +959,7 @@ func (s *acpSession) Send(prompt string, messageID string, images []core.ImageAt
 	}
 
 	slog.Debug("acp: sending session/prompt", "session_id", sid, "prompt_len", len(prompt))
+	s.endCancelDrop()
 	s.promptInFlight.Add(1)
 	res, err := s.tr.call(s.ctx, "session/prompt", params)
 	if err != nil {
@@ -1044,6 +1080,7 @@ func (s *acpSession) CancelTurn() error {
 		return fmt.Errorf("acp: transport not available")
 	}
 	slog.Debug("acp: cancelling current turn", "session_id", sid)
+	s.beginCancelDrop()
 	return s.tr.sendNotification("session/cancel", map[string]any{
 		"sessionId": sid,
 	})
@@ -1055,6 +1092,7 @@ func (s *acpSession) Alive() bool {
 
 func (s *acpSession) Close() error {
 	s.alive.Store(false)
+	s.stopBackgroundTimers()
 	s.cancel()
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()

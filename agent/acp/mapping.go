@@ -47,6 +47,10 @@ func mapSessionUpdate(sessionID string, params json.RawMessage) []core.Event {
 		// Context token accounting; cached on the session for
 		// GetContextUsage (see maybeAbsorbUsageUpdate), never rendered.
 		return nil
+	case "response_completed", "turn_completed":
+		// Grok / vendor turn-boundary signals. Usage is absorbed on the
+		// session; these must not be treated as text via the fallback.
+		return nil
 	default:
 		// Optional vendor / future ACP shapes — best-effort text extraction.
 		return mapSessionUpdateFallback(sid, head.SessionUpdate, wrap.Update)
